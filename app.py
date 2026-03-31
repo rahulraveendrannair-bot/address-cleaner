@@ -149,6 +149,40 @@ def guess_col(headers, field):
             return h
     return ""
 
+
+def extract_from_address1(address1, city, postal):
+    """Extract postal code or city name if mixed inside ADDRESS1."""
+    if not address1 or str(address1).strip() in ('', 'nan'):
+        return address1, city, postal
+    s = str(address1).strip()
+    parts = [p.strip() for p in s.split(',')]
+    new_city   = '' if str(city   or '').strip() in ('', 'nan') else str(city).strip()
+    new_postal = '' if str(postal or '').strip() in ('', 'nan') else str(postal).strip()
+    clean_parts = []
+    for part in parts:
+        if re.match(r"^\d{4,6}$", part) and not new_postal:
+            new_postal = part
+        elif re.match(r"^[Gg]\.\s*\w+", part) and not new_city:
+            new_city = re.sub(r"^[Gg]\.\s*", "", part).strip()
+        else:
+            clean_parts.append(part)
+    return ', '.join(clean_parts), new_city, new_postal
+
+def extract_from_city(city, postal):
+    """Extract postal code if mixed inside CITY field (e.g. Saint Petersburg, 196210)."""
+    if not city or str(city).strip() in ('', 'nan'):
+        return city, postal
+    s = str(city).strip()
+    new_postal = '' if str(postal or '').strip() in ('', 'nan') else str(postal).strip()
+    parts = [p.strip() for p in s.split(',')]
+    clean_parts = []
+    for part in parts:
+        if re.match(r"^\d{4,6}$", part) and not new_postal:
+            new_postal = part
+        else:
+            clean_parts.append(part)
+    return ', '.join(clean_parts), new_postal
+
 # ── UI ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -222,6 +256,28 @@ if run:
     with st.spinner("Cleaning addresses..."):
         df = df_raw.copy()
         diffs = []
+
+        # Pre-process: extract postal/city mixed into ADDRESS1 or CITY
+        if o_addr or o_city:
+            addr_col   = col_map.get("address","")
+            city_col   = col_map.get("city","")
+            postal_col = col_map.get("postal","")
+            for idx, row in df.iterrows():
+                addr   = str(row[addr_col]   if addr_col   else "")
+                city   = str(row[city_col]   if city_col   else "")
+                postal = str(row[postal_col] if postal_col else "")
+                # Extract from ADDRESS1
+                new_addr, new_city, new_postal = extract_from_address1(addr, city, postal)
+                if addr_col   and new_addr   != addr:   df.at[idx, addr_col]   = new_addr
+                if city_col   and new_city   != city:   df.at[idx, city_col]   = new_city
+                if postal_col and new_postal != postal: df.at[idx, postal_col] = new_postal
+                # Extract postal from CITY
+                if city_col and postal_col:
+                    city2   = str(df.at[idx, city_col])
+                    postal2 = str(df.at[idx, postal_col])
+                    new_city2, new_postal2 = extract_from_city(city2, postal2)
+                    if new_city2   != city2:   df.at[idx, city_col]   = new_city2
+                    if new_postal2 != postal2: df.at[idx, postal_col] = new_postal2
 
         # Clean ADDRESS1
         if o_addr and col_map.get("address"):
