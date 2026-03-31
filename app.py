@@ -183,6 +183,103 @@ def extract_from_city(city, postal):
             clean_parts.append(part)
     return ', '.join(clean_parts), new_postal
 
+
+INDIAN_STATES_INF = {
+    'maharashtra','karnataka','gujarat','uttar pradesh','west bengal',
+    'andhra pradesh','telangana','kerala','punjab','haryana','rajasthan',
+    'tamil nadu','madhya pradesh','odisha','jharkhand','chhattisgarh','assam','bihar',
+    'himachal pradesh','uttarakhand','goa',
+}
+CHINESE_PROV_INF = {
+    'shandong','guangdong','zhejiang','jiangsu','sichuan','hubei','hunan','henan',
+    'hebei','fujian','liaoning','yunnan','guangxi','beijing','shanghai','tianjin',
+}
+RUSSIAN_CITIES_INF = {
+    'moscow','saint petersburg','novosibirsk','yekaterinburg','kazan','krasnodar',
+    'saratov','tyumen','ufa','irkutsk','khabarovsk','yaroslavl','vladivostok',
+    'tomsk','orenburg','kemerovo','ryazan','astrakhan','tula','kirov','bryansk',
+    'kursk','tver','ivanovo','belgorod','murmansk','surgut','vladimir','arkhangelsk',
+    'sochi','stavropol','makhachkala','noyabrsk','yugorsk','novy urengoy','omsk',
+    'perm','samara','voronezh','volgograd','rostov-on-don',
+}
+RUSSIAN_STATE_KW_INF = re.compile(
+    r"\b(Oblast|Krai|Kray|Okrug|Bashkortostan|Tatarstan|Dagestan|Komi|Udmurt|"
+    r"Mari|Leningrad|Sverdlovsk|Novosibirsk|Saratov|Volgogradskaya|Penzenskaya)\b", re.I
+)
+
+def infer_country(city, state, postal):
+    c = str(city  or "").strip().lower()
+    s = str(state or "").strip().lower()
+    p = str(postal or "").strip()
+    if s in INDIAN_STATES_INF:      return "India"
+    if s in CHINESE_PROV_INF:       return "China"
+    if RUSSIAN_STATE_KW_INF.search(s): return "Russia"
+    if c in RUSSIAN_CITIES_INF:     return "Russia"
+    if re.match(r"^\d{6}$", p):
+        if s in CHINESE_PROV_INF:   return "China"
+        if s in INDIAN_STATES_INF:  return "India"
+        return "Russia"
+    return ""
+
+
+COUNTRY_TO_CODE = {
+    'russia':'RU','ukraine':'UA','belarus':'BY','kazakhstan':'KZ','china':'CN',
+    'india':'IN','united states':'US','united kingdom':'GB','germany':'DE',
+    'france':'FR','netherlands':'NL','belgium':'BE','switzerland':'CH','austria':'AT',
+    'sweden':'SE','norway':'NO','denmark':'DK','finland':'FI','poland':'PL',
+    'czech republic':'CZ','hungary':'HU','romania':'RO','bulgaria':'BG','greece':'GR',
+    'portugal':'PT','ireland':'IE','luxembourg':'LU','malta':'MT','cyprus':'CY',
+    'croatia':'HR','serbia':'RS','slovenia':'SI','slovakia':'SK','estonia':'EE',
+    'latvia':'LV','lithuania':'LT','moldova':'MD','armenia':'AM','azerbaijan':'AZ',
+    'georgia':'GE','kyrgyzstan':'KG','uzbekistan':'UZ','tajikistan':'TJ',
+    'japan':'JP','south korea':'KR','hong kong':'HK','taiwan':'TW','singapore':'SG',
+    'malaysia':'MY','indonesia':'ID','thailand':'TH','vietnam':'VN','philippines':'PH',
+    'pakistan':'PK','bangladesh':'BD','sri lanka':'LK','nepal':'NP',
+    'united arab emirates':'AE','saudi arabia':'SA','israel':'IL','turkey':'TR',
+    'south africa':'ZA','nigeria':'NG','kenya':'KE','egypt':'EG','liberia':'LR',
+    'namibia':'NA','canada':'CA','mexico':'MX','brazil':'BR','argentina':'AR',
+    'australia':'AU','new zealand':'NZ','british virgin islands':'VG',
+    'isle of man':'IM','bermuda':'BM','cayman islands':'KY',
+}
+
+def update_country_id(df, col_map):
+    """Fill COUNTRY_ID where empty, using ISO code from COUNTRY column."""
+    country_col    = col_map.get("country","")
+    country_id_col = "COUNTRY_ID"
+    if not country_col or country_id_col not in df.columns:
+        return df, []
+    changes = []
+    for idx, row in df.iterrows():
+        cid     = str(row.get(country_id_col,"") or "").strip()
+        country = str(row.get(country_col,"")    or "").strip()
+        if country and (not cid or cid == "nan"):
+            code = COUNTRY_TO_CODE.get(country.lower(), "")
+            if code:
+                df.at[idx, country_id_col] = code
+                changes.append({"Row": idx+1, "Field": country_id_col,
+                                 "Before": "", "After": code})
+    return df, changes
+
+
+COUNTRY_TO_CODE = {
+    'russia':'RU','ukraine':'UA','belarus':'BY','kazakhstan':'KZ','china':'CN',
+    'india':'IN','united states':'US','united kingdom':'GB','germany':'DE',
+    'france':'FR','british virgin islands':'VG','isle of man':'IM','bermuda':'BM',
+    'luxembourg':'LU','switzerland':'CH','moldova':'MD','azerbaijan':'AZ',
+    'malta':'MT','serbia':'RS','cyprus':'CY','kyrgyzstan':'KG','armenia':'AM',
+    'austria':'AT','greece':'GR','romania':'RO','vietnam':'VN','taiwan':'TW',
+    'hong kong':'HK','singapore':'SG','united arab emirates':'AE','turkey':'TR',
+    'netherlands':'NL','belgium':'BE','sweden':'SE','norway':'NO','denmark':'DK',
+    'finland':'FI','poland':'PL','czechia':'CZ','hungary':'HU','portugal':'PT',
+    'ireland':'IE','liberia':'LR','namibia':'NA','canada':'CA','australia':'AU',
+    'japan':'JP','south korea':'KR','brazil':'BR','mexico':'MX','georgia':'GE',
+    'estonia':'EE','latvia':'LV','lithuania':'LT','croatia':'HR','slovenia':'SI',
+    'slovakia':'SK','bulgaria':'BG','thailand':'TH','malaysia':'MY',
+    'indonesia':'ID','philippines':'PH','pakistan':'PK','bangladesh':'BD',
+    'israel':'IL','saudi arabia':'SA','egypt':'EG','south africa':'ZA',
+    'uzbekistan':'UZ','tajikistan':'TJ','turkmenistan':'TM','mongolia':'MN',
+}
+
 # ── UI ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -319,6 +416,45 @@ if run:
         # Quality
         if o_quality:
             df["DATA_QUALITY"] = df.apply(lambda r: quality(r.to_dict(), col_map), axis=1)
+
+        # Infer missing COUNTRY from city/state/postal signals
+        country_col = col_map.get("country","")
+        if country_col:
+            for idx, row in df.iterrows():
+                if not str(row.get(country_col,"")).strip() or str(row.get(country_col,"")).strip() == "nan":
+                    inferred = infer_country(
+                        row.get(col_map.get("city",""),""),
+                        row.get(col_map.get("state",""),""),
+                        row.get(col_map.get("postal",""),"")
+                    )
+                    if inferred:
+                        df.at[idx, country_col] = inferred
+                        diffs.append({"Row": idx+1, "Field": country_col,
+                                      "Before": "", "After": f"[inferred] {inferred}"})
+            # Recalculate quality and postal flag after country inference
+            if o_quality:
+                df["DATA_QUALITY"] = df.apply(lambda r: quality(r.to_dict(), col_map), axis=1)
+            # Update COUNTRY_ID from COUNTRY name
+            country_id_col = None
+            for col in df.columns:
+                if col.lower().replace('_','') == 'countryid':
+                    country_id_col = col; break
+            if country_id_col and country_col:
+                for idx, row in df.iterrows():
+                    if not str(row.get(country_id_col,'')).strip() or str(row.get(country_id_col,'')).strip() == 'nan':
+                        country_name = str(row.get(country_col,'')).strip().lower()
+                        code = COUNTRY_TO_CODE.get(country_name,'')
+                        if code:
+                            df.at[idx, country_id_col] = code
+                            diffs.append({"Row": idx+1, "Field": country_id_col,
+                                          "Before": "", "After": f"[inferred] {code}"})
+            if o_postal and col_map.get("postal"):
+                df["POSTAL_FLAG"] = df.apply(
+                    lambda r: validate_postal(r[col_map["postal"]], r.get(country_col,"") if country_col else ""), axis=1
+                )
+        # Update COUNTRY_ID from COUNTRY using ISO codes
+        df, cid_changes = update_country_id(df, col_map)
+        diffs.extend(cid_changes)
 
         st.session_state["cleaned_df"] = df
         st.session_state["diffs"] = diffs
