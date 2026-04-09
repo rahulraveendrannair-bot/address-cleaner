@@ -223,7 +223,7 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
     Does NOT expand abbreviations.
     """
     if not a1: return a1, ex_city, ex_postal, ex_country, '', ''
-    city=ex_city.strip(); postal=ex_postal.strip(); country=ex_country.strip()
+    city=ex_city.strip(); postal=ex_postal.strip(); country=ex_country.strip(); a2_add=''
     parts=[p.strip() for p in a1.split(',') if p.strip()]
     street_parts=[]
 
@@ -244,6 +244,12 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
 
     def strip_tail(s, c='', p='', co=''):
         """Strip Country/Postal/City from right end. Returns (street, city, postal, country)."""
+        # Handle whole string = country name (e.g. "Turkey." or "Russia")
+        s_stripped = s.strip().rstrip('.,')
+        if re.fullmatch(COUNTRY_RE.pattern, s_stripped, re.I):
+            if not co: co = s_stripped
+            return '', c, p, co
+
         # Country+Postal together: "Turkey 34758" or "Russia 119071"
         mc_p=re.search(r'\s+('+COUNTRY_RE.pattern+r')\s+(\d{4,7})\s*$',s,re.I)
         if mc_p:
@@ -297,16 +303,17 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
         if ISO2_RE.match(part) and part in ISO_TO_COUNTRY and part not in ('No','D'):
             if not country: country=ISO_TO_COUNTRY[part]
             continue
+        # Strip trailing punctuation for country checks
+        part_stripped = re.sub(r'[\.\,\s]+$', '', part).strip()
         # Country+Postal BEFORE Country-alone
-        mc_p=re.match(r'^('+COUNTRY_RE.pattern+r')\s+(\d{4,7})\s*$',part,re.I)
+        mc_p=re.match(r'^('+COUNTRY_RE.pattern+r')\s+(\d{4,7})\s*$',part_stripped,re.I)
         if mc_p:
             if not country: country=mc_p.group(1)
             if not postal:  postal=mc_p.group(mc_p.lastindex)
             continue
-        # Country alone (fullmatch)
-        clean_p=re.sub(r'\d+\.?\d*\s*$','',part).strip()
-        if COUNTRY_RE.search(clean_p) and re.fullmatch(COUNTRY_RE.pattern,clean_p,re.I):
-            if not country: country=clean_p
+        # Country alone (fullmatch) — use part_stripped to handle "Turkey." etc.
+        if COUNTRY_RE.search(part_stripped) and re.fullmatch(COUNTRY_RE.pattern,part_stripped,re.I):
+            if not country: country=part_stripped
             continue
         # Standalone city adjacent to geo part
         if is_city_part(part) and not city:
@@ -332,10 +339,19 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
                 if not postal: postal=m2.group(1)
                 if not city:   city=m2.group(2)
                 street_parts.append(part[:m2.start()].strip()); continue
-        # City appended to street: "...Cad. Izmir"
+        # City appended to street: "...Cad. Izmir" or "...Kat Tuzla/Istanbul"
         words=part.split()
         if len(words)>1 and not city:
             last=words[-1]
+            # Handle "District/City" slash pattern (e.g. "Tuzla/Istanbul")
+            if '/' in last and last.count('/') == 1:
+                sp = last.split('/')
+                if (re.match(r'^[A-ZÀ-ɏ]', sp[0]) and
+                        re.match(r'^[A-ZÀ-ɏ]', sp[1])):
+                    a2_add = sp[0]
+                    city   = sp[1]
+                    street_parts.append(' '.join(words[:-1]).strip())
+                    continue
             if (re.match(r'^[A-ZÀ-ɏ]',last) and not re.match(r'^\d',last)
                     and not ADDR_RE.search(last) and not COUNTRY_RE.match(last) and len(last)>2):
                 rest=' '.join(words[:-1])
