@@ -279,7 +279,7 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
                 uk_str=uk_m.group(1).replace(' ','').upper() if uk_m else ''
                 if uk_m and s.replace(' ','').upper().endswith(uk_str):
                     if not p: p=uk_m.group(1)
-                    s=s[:s.upper().rfind(uk_str[0])].rstrip().rstrip()
+                    s=s[:uk_m.start()].strip()  # use match position, not rfind
                     # s may now be a country name (e.g. 'SCOTLAND')
                     s_stripped=s.strip().rstrip('.,')
                     if re.fullmatch(COUNTRY_RE.pattern,s_stripped,re.I):
@@ -287,13 +287,38 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
                         s=''
                 else:
                     mp=re.search(r'\s+(\d{4,7})\.?\d*\s*$',s)
-                    if mp and not re.match(r'^\d',s):
+                    if mp:
                         if not p: p=re.sub(r'\.0+$','',mp.group(1))
                         s=s[:mp.start()].strip()
         # City: last 1 word — but skip if postal+district already handled end of address
         # (e.g. '72201 Ebene' already accounts for the address tail)
         if _postal_district_found:
             return s,c,p,co,a2
+        # US address pattern: strip state abbreviation then extract city
+        if not c and p and s:
+            words_tmp=s.split()
+            last_tmp=words_tmp[-1].upper() if words_tmp else ''
+            if last_tmp in US_STATE_EXPAND:
+                # Strip state abbrev, then find city after last street keyword
+                s_no_state=' '.join(words_tmp[:-1]).strip()
+                state_full=US_STATE_EXPAND[last_tmp]
+                if not co: co='United States'
+                # Find last street keyword to split street / city
+                ws=s_no_state.split()
+                last_kw=-1
+                for ki,kw in enumerate(ws):
+                    if ADDR_RE.search(kw): last_kw=ki
+                if last_kw>=0:
+                    after_kw=ws[last_kw+1:]
+                    city_start=0
+                    for ji,jw in enumerate(after_kw):
+                        if re.match(r'^\d',jw): city_start=ji+1
+                        else: break
+                    s=' '.join(ws[:last_kw+1+city_start])
+                    c=' '.join(after_kw[city_start:])
+                else:
+                    s=s_no_state
+                return s,c,p,co,a2
         words=s.split()
         if len(words)==1:
             w=words[0]
@@ -329,12 +354,15 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
             if not postal: postal=re.sub(r'\.0+$','',part)
             continue
         # UK postcode standalone: 'BD7 1NX', 'EC3A 8BF'
-        if UK_POST_RE.match(part.strip()) and re.match(r'^[A-Z]{1,2}\d',part.strip(),re.I):
-            if not postal: postal=part.strip()
+        m_uk=UK_POST_RE.match(part.strip())
+        if m_uk and re.match(r'^[A-Z]{1,2}\d',part.strip(),re.I) and len(part.strip())<=9:
+            # Only if whole part IS the postcode (no trailing country like 'EC3A 8EE UK')
+            if not postal: postal=m_uk.group(1)
             continue
-        # "8600 Dübendorf"
+        # "8600 Dübendorf" — only if city part has no street keywords
+        # (prevents '1625 Mid Valley Drive...' being treated as postal+city)
         m1=re.match(r'^(\d{4,5})\s+([A-ZÀ-ɏ]\S.+)$',part)
-        if m1:
+        if m1 and not ADDR_RE.search(m1.group(2)):
             if not postal: postal=m1.group(1)
             if not city:   city=m1.group(2)
             continue
@@ -416,6 +444,27 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
         # Values extracted but A1 still has them — strip them out
         rem,_,_,_,_=strip_tail(a1, city, postal, country)
         if rem and rem != a1: street_parts.append(rem)
+
+    # Post-loop: if UK postcode found but city still empty,
+    # try extracting city from last word of last street part
+    # Only for UK postcodes (alphanumeric) to avoid false positives
+    _has_uk_postal = bool(postal and re.match(r'^[A-Z]{1,2}\d', postal, re.I))
+    if not city and _has_uk_postal and street_parts:
+        last_part = street_parts[-1]
+        lp_words  = last_part.split()
+        if len(lp_words) >= 2:
+            lp_last = lp_words[-1]
+            lp_rest = ' '.join(lp_words[:-1])
+            if (re.match(r'^[A-Z\u00C0-\u024F]', lp_last)
+                    and not re.match(r'^\d', lp_last)
+                    and not ADDR_RE.search(lp_last)
+                    and not COUNTRY_RE.match(lp_last)
+                    and len(lp_last) > 2
+                    and lp_last.lower() not in lp_rest.lower()):
+                city = lp_last
+                street_parts[-1] = lp_rest.strip()
+                if not street_parts[-1]:
+                    street_parts.pop()
 
     if country:
         country=COUNTRY_NORMALIZE.get(country.lower().strip(),country) or country
