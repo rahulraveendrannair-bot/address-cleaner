@@ -827,9 +827,16 @@ if run:
         # ── 14. Fill COUNTRY_ID ───────────────────────────────────
         fc = str(df.at[idx,C('country')] if C('country') else '').strip()
         fi = str(df.at[idx,C('country_id')] if C('country_id') else '').strip()
-        if fc and not fi and C('country_id'):
-            code = get_country_code(fc)
-            if code: setcol(idx,'country_id',code)
+        if C('country_id'):
+            if fi and not ISO2_RE.match(fi):
+                # COUNTRY_ID has a full name (e.g. 'Egypt') → convert to ISO code
+                code = get_country_code(fi)
+                if not code and fc: code = get_country_code(fc)
+                if code: setcol(idx,'country_id',code); fi=code
+            elif fc and not fi:
+                # COUNTRY_ID is empty → fill from COUNTRY
+                code = get_country_code(fc)
+                if code: setcol(idx,'country_id',code)
 
         # ── 15. Postal validation ─────────────────────────────────
         if o_postal and C('postal'):
