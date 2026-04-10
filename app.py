@@ -562,6 +562,7 @@ def data_quality(row, col_map):
 
 # ── Column hint detection ─────────────────────────────────────────
 HINTS = {
+    'address_id':  ['addressid','address_id','addressno','addressnumber','addr_id','addrid'],
     'address':    ['address1','address','addr1','street','line1'],
     'address2':   ['address2','addr2','line2'],
     'address3':   ['address3','addr3','line3'],
@@ -694,7 +695,7 @@ with st.sidebar:
 
             st.divider()
             st.subheader("Column Mapping")
-            for field in ['address','address2','address3','city','state','postal','country','country_id']:
+            for field in ['address_id','address','address2','address3','city','state','postal','country','country_id']:
                 default = guess_col(headers, field)
                 idx = headers.index(default)+1 if default in headers else 0
                 col_map[field] = st.selectbox(
@@ -754,10 +755,13 @@ if run:
             splits = split_multi_address(a1_raw)
             if len(splits) > 1:
                 drop_idx.append(idx)
-                for label, addr in splits:
+                for seq, (label, addr) in enumerate(splits, start=1):
                     new_row = row.copy()
                     new_row[C('address')] = addr
-                    # Optionally store label in ADDRESS2 if it's empty
+                    # Assign sequential ADDRESS_ID: 1, 2, 3, ...
+                    if C('address_id'):
+                        new_row[C('address_id')] = seq
+                    # Store branch label in ADDRESS2 if it's empty
                     if label and C('address2') and not str(new_row.get(C('address2'),'') or '').strip():
                         new_row[C('address2')] = label
                     new_rows.append(new_row)
