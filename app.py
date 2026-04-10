@@ -1065,6 +1065,41 @@ if run:
                 setcol(idx,'country',norm); cou=norm
             setcol(idx,'city','')
 
+        # ── 12b. Scan all columns for country name when COUNTRY is blank ──────
+        cou_now = str(df.at[idx,C('country')] if C('country') else '').strip()
+        if not cou_now:
+            scan_cols = [
+                C('address'), C('address2'), C('address3'),
+                C('state'), C('city'), C('postal')
+            ]
+            for _col in scan_cols:
+                if not _col: continue
+                _val = str(df.at[idx, _col] if _col in df.columns else '').strip()
+                if not _val: continue
+                # Check if the whole value is a country name
+                _val_stripped = re.sub(r'[.,]+$', '', _val).strip()
+                if COUNTRY_RE.search(_val_stripped) and re.fullmatch(COUNTRY_RE.pattern, _val_stripped, re.I):
+                    _norm = normalize_country(_val_stripped)
+                    record(idx, 'country', '', _norm)
+                    setcol(idx, 'country', _norm); cou = _norm
+                    # Clear the source column only if it contained ONLY the country name
+                    if _val_stripped.lower() == _norm.lower() or _val_stripped.lower() in COUNTRY_NORMALIZE:
+                        if _col != C('address'):  # never wipe ADDRESS1
+                            df.at[idx, _col] = ''
+                    break
+                # Also check: does the value END with a country name after a comma?
+                _parts = [p.strip() for p in _val.split(',')]
+                for _p in reversed(_parts):
+                    _p_stripped = re.sub(r'[.,]+$', '', _p).strip()
+                    if (COUNTRY_RE.search(_p_stripped) and
+                            re.fullmatch(COUNTRY_RE.pattern, _p_stripped, re.I) and
+                            not ADDR_RE.search(_p_stripped)):
+                        _norm = normalize_country(_p_stripped)
+                        record(idx, 'country', '', _norm)
+                        setcol(idx, 'country', _norm); cou = _norm
+                        break
+                if cou: break
+
         # ── 13. Infer COUNTRY if missing ──────────────────────────
         if o_infer:
             cou_now = str(df.at[idx,C('country')] if C('country') else '').strip()
