@@ -287,6 +287,20 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
     """
     if not a1: return a1, ex_city, ex_postal, ex_country, '', ''
     city=ex_city.strip(); postal=ex_postal.strip(); country=ex_country.strip(); a2_add=''
+
+    # Quick check: no-comma 'Street HouseNo PostalCode City' pattern
+    # e.g. 'Bahnhofplatz 2 8001 Zurich' → A1='Bahnhofplatz 2', postal='8001', city='Zurich'
+    if ',' not in a1 and not postal and not city:
+        _spc = re.search(
+            r'^(.+?)\s+(\d{4,5})\s+([A-ZÀ-ɏ][A-Za-zÀ-ɏ\u00C0-\u024F][A-Za-zÀ-ɏ\u00C0-\u024F\s\-]*)\s*$',
+            a1)
+        if _spc:
+            _st, _ps, _ct = _spc.group(1).strip(), _spc.group(2), _spc.group(3).strip()
+            _ends_num = bool(re.search(r'\d$', _st))
+            _has_addr = bool(ADDR_RE.search(_st))
+            if (_ends_num or _has_addr) and _ct.lower() in CITY_TO_COUNTRY:
+                return _st, _ct, _ps, normalize_country(CITY_TO_COUNTRY[_ct.lower()]), '', ''
+
     parts=[p.strip() for p in a1.split(',') if p.strip()]
     street_parts=[]
 
@@ -378,6 +392,21 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
                     s=s[:mc2.start()].strip()
             elif mc2 and co:
                 s=s[:mc2.start()].strip()
+        # Street-Postal-City: detect 'Bahnhofplatz 2 8001 Zurich' style (no commas)
+        # Pattern: ...StreetWords... PostalCode CityName
+        if not p and not c:
+            _spc_m = re.search(
+                r'^(.+?)\s+(\d{4,5})\s+([A-ZÀ-ɏ][A-Za-zÀ-ɏ\u00C0-\u024F\-\s]+)$', s)
+            if _spc_m:
+                _st = _spc_m.group(1).strip()
+                _ps = _spc_m.group(2)
+                _ct = _spc_m.group(3).strip()
+                _has_kw  = bool(ADDR_RE.search(_st))
+                _ends_num = bool(re.search(r'\d$', _st))
+                _city_known = _ct.lower() in CITY_TO_COUNTRY
+                if (_has_kw or _ends_num) and _city_known:
+                    s = _st; p = _ps; c = _ct
+
         # City: last 1 word — but skip if postal+district already handled end of address
         # (e.g. '72201 Ebene' already accounts for the address tail)
         if _postal_district_found:
