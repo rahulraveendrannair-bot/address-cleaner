@@ -55,6 +55,8 @@ STATE_KW = re.compile(
     re.I
 )
 
+TOWNSHIP_RE = re.compile(r'\b\w[\w\s\-]*Township\b', re.I)
+
 DISTRICT_RE = re.compile(
     r'\b(\w[\w\s\-]+(?:District|Qu\b|gu\b|dong\b|guyok\b|Ward\b|'
     r'Quarter\b|Arrondissement\b))\b', re.I
@@ -177,6 +179,10 @@ def parse_city_field(cty):
     if not cty: return '', '', ''
     s = cty.strip()
 
+    def _is_township(p):
+        """Returns True if p is a Township/Borough/Parish phrase that belongs in ADDRESS3."""
+        return bool(re.search(r'\bTownship\b', p, re.I))
+
     def _is_state(p):
         p_lower = p.lower()
         p_stripped = re.sub(r'\s+(Province|Oblast|Krai|Region|Prefecture)$','',p,flags=re.I).strip().lower()
@@ -190,6 +196,33 @@ def parse_city_field(cty):
         m = STATE_KW.search(s)
         if m:
             before = s[:m.start()].strip()
+            # If STATE_KW is at the END → usually whole string is state/district
+            # BUT if the word immediately before the keyword is a known place name,
+            # split: city = text before that word, state = known_place + keyword
+            # e.g. 'Guangzhou city Guangdong province' → city='Guangzhou city', state='Guangdong province'
+            # e.g. 'South Okkalapa Township' → city='', addr3='South Okkalapa Township'
+            if m.end() >= len(s.rstrip()):
+                # Township/Borough/Parish → goes to ADDRESS3, not state
+                if _is_township(s):
+                    return '', '', s
+                last_word = before.split()[-1].lower() if before.split() else ''
+                if last_word and (last_word in KNOWN_STATES or last_word in CITY_TO_COUNTRY):
+                    # Split before the known place name
+                    split_pos = before.lower().rfind(last_word)
+                    city_part = before[:split_pos].strip()
+                    state_part = s[split_pos:].strip()
+                    return city_part, state_part, ''
+                return '', s, ''
+            # STATE_KW in middle: text after keyword = city
+            # e.g. 'Sanchuang Township Yangon' → addr3='Sanchuang Township', city='Yangon'
+            after = s[m.end():].strip()
+            if after and not STATE_KW.search(after):
+                state_or_addr3 = s[:m.end()].strip()
+                if _is_township(state_or_addr3):
+                    return after, '', state_or_addr3
+                return after, state_or_addr3, ''
+            # STATE_KW at end with multi-word prefix: split at last space before keyword
+            # e.g. 'Guangzhou city Guangdong province' → city='Guangzhou city', state='Guangdong province'
             last_sp = before.rfind(' ')
             if last_sp > 0:
                 return before[:last_sp].strip(), s[last_sp+1:].strip(), ''
@@ -197,15 +230,38 @@ def parse_city_field(cty):
 
     # Comma-separated
     parts = [p.strip() for p in s.split(',') if p.strip()]
-    region_idx  = set()
-    country_idx = set()
+    region_idx    = set()
+    country_idx   = set()
+    township_idx  = set()
     for i, p in enumerate(parts):
-        if _is_country(p):  country_idx.add(i)
-        elif _is_state(p):  region_idx.add(i)
+        if _is_country(p):   country_idx.add(i)
+        elif _is_township(p): township_idx.add(i)
+        elif _is_state(p):   region_idx.add(i)
 
-    other = [parts[i] for i in range(len(parts)) if i not in region_idx and i not in country_idx]
+    other = [parts[i] for i in range(len(parts))
+             if i not in region_idx and i not in country_idx and i not in township_idx]
+
+    # Handle pure-township parts that were separated above
+    if not other and township_idx:
+        # Township(s) with no city — township goes to addr3
+        twn_parts = [parts[i] for i in sorted(township_idx)]
+        st_parts  = [parts[i] for i in sorted(region_idx)]
+        city = next((p for p in st_parts if not STATE_KW.search(p) and p.lower() in CITY_TO_COUNTRY), '')
+        if city: st_parts = [p for p in st_parts if p != city]
+        return city, ', '.join(st_parts), ', '.join(twn_parts)
 
     if not other:
+        # All parts classified as state — pick the part without a STATE_KW keyword as city
+        # (e.g. 'Hlaing Township, Yangon': Yangon has no STATE_KW, Hlaing Township does)
+        non_kw = [parts[i] for i in sorted(region_idx) if not STATE_KW.search(parts[i])]
+        kw     = [parts[i] for i in sorted(region_idx) if STATE_KW.search(parts[i])]
+        if non_kw:
+            # Prefer CITY_TO_COUNTRY hit among non-kw parts
+            city = next((p for p in non_kw if p.lower() in CITY_TO_COUNTRY), non_kw[0])
+            state_parts = [p for p in kw if p.lower() != city.lower()]
+            state_parts += [p for p in non_kw if p != city]
+            return city, ', '.join(state_parts), ''
+        # All parts have STATE_KW — treat first as state, second as city if it exists
         city = parts[0]
         remaining = [parts[i] for i in range(1,len(parts)) if i not in country_idx]
         return city, ', '.join(remaining), ''
@@ -214,8 +270,9 @@ def parse_city_field(cty):
     for p in other:
         if p.lower() in CITY_TO_COUNTRY: city = p; break
 
-    state_parts = [parts[i] for i in sorted(region_idx) if parts[i].lower() != city.lower()]
-    addr3_parts = [p for p in other if p != city]
+    state_parts    = [parts[i] for i in sorted(region_idx) if parts[i].lower() != city.lower()]
+    township_parts = [parts[i] for i in sorted(township_idx)]
+    addr3_parts    = [p for p in other if p != city] + township_parts
     return city, ', '.join(state_parts), ', '.join(addr3_parts)
 
 
