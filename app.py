@@ -41,7 +41,8 @@ ADDR_RE = re.compile(
     r'Way\b|Walk\b|Hill\b|Gate\b|Gardens|Terrace|Heights|Manor|House\b|'
     r'Chemin|Rue\b|Boulevard|Weg\b|Gasse|Platz|Allee|Zona|Promyshlennaya|'
     r'ul\b|d\b(?=\s*\d)|Str\b|Mah\b|Blok\b|Kat\b|Daire\b|Pasa\b|'
-    r'Warehouse|Office|Factory|Logistics|Industrial|Complex|Terminal|Hub)'
+    r'Warehouse|Office|Factory|Logistics|Industrial|Complex|Terminal|Hub|'
+    r'Junction|Interchange|Roundabout|Bypass|Flyover|Overpass)'
     r'|strasse\b|straße\b|gasse\b|\bplatz\b',
     re.I
 )
@@ -550,7 +551,10 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
             # Also fire if next part is a state/province (e.g. 'Lahore, Punjab Province, Pakistan')
             nxt_state=(i+1<len(parts) and STATE_KW.search(parts[i+1])
                        and not ADDR_RE.search(parts[i+1]))
-            if nxt or prv or nxt_state: city=part; continue
+            # Also fire if previous part is a street address (ADDR_RE match)
+            # e.g. 'Abali Road/Azmayesh Junction, Tehran' → Tehran is city
+            prv_addr=(i>0 and bool(ADDR_RE.search(parts[i-1])) and not has_geo(parts[i-1]))
+            if nxt or prv or nxt_state or prv_addr: city=part; continue
         # Embedded country/postal/ISO
         has_c=bool(COUNTRY_RE.search(part)) and not ISO2_RE.match(part.strip())
         has_p=bool(re.search(r'\s\d{4,7}\.?\d*\s*$',part))
