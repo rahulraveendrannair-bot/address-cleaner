@@ -760,7 +760,7 @@ if run:
                     new_row[C('address')] = addr
                     # Assign sequential ADDRESS_ID: 1, 2, 3, ...
                     if C('address_id'):
-                        new_row[C('address_id')] = seq
+                        new_row[C('address_id')] = str(seq)
                     # Store branch label in ADDRESS2 if it's empty
                     if label and C('address2') and not str(new_row.get(C('address2'),'') or '').strip():
                         new_row[C('address2')] = label
