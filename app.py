@@ -40,7 +40,8 @@ ADDR_RE = re.compile(
     r'Plaza|Tower|Center|Centre|Park|Square|Close|Court|Crescent|Grove|'
     r'Way\b|Walk\b|Hill\b|Gate\b|Gardens|Terrace|Heights|Manor|House\b|'
     r'Chemin|Rue\b|Boulevard|Weg\b|Gasse|Platz|Allee|Zona|Promyshlennaya|'
-    r'ul\b|d\b(?=\s*\d)|Str\b|Mah\b|Blok\b|Kat\b|Daire\b|Pasa\b)'
+    r'ul\b|d\b(?=\s*\d)|Str\b|Mah\b|Blok\b|Kat\b|Daire\b|Pasa\b|'
+    r'Warehouse|Office|Factory|Logistics|Industrial|Complex|Terminal|Hub)'
     r'|strasse\b|straße\b|gasse\b|\bplatz\b',
     re.I
 )
@@ -238,12 +239,19 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
         if not p or ADDR_RE.search(p) or re.match(r'^\d',p): return False
         if COUNTRY_RE.search(p): return False
         if ISO2_RE.match(p) and p in ISO_TO_COUNTRY: return False
+        # Exclude unit/floor codes like G03, B12, F01 (letter + digits)
+        if re.match(r'^[A-Z]\d{1,4}[A-Z]?$', p, re.I): return False
+        # Exclude province/state/district names (they are never cities)
+        if STATE_KW.search(p): return False
         words=p.split()
         if len(words)>2: return False
         return bool(re.match(r'^[A-ZÀ-ɏ]',p) and len(p)<40)
 
     def has_geo(part):
-        return (bool(COUNTRY_RE.search(part)) or
+        # Only flag country-as-geo if country word is at the END or IS the whole part
+        # (prevents "China Resources Logistics" triggering via the word "China")
+        cou_at_end=bool(re.search(r'(?:^|\s)('+COUNTRY_RE.pattern+r')\s*$',part,re.I))
+        return (cou_at_end or
                 bool(re.search(r'\d{4,7}\s*$',part)) or
                 bool(ISO2_RE.match(part.strip()) and part.strip() in ISO_TO_COUNTRY))
 
@@ -345,7 +353,10 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
         words=s.split()
         if len(words)==1:
             w=words[0]
-            if re.match(r'^[A-ZÀ-ɏ]',w) and not re.match(r'^\d',w) and not COUNTRY_RE.match(w) and len(w)>1:
+            if (re.match(r'^[A-ZÀ-ɏ]',w) and not re.match(r'^\d',w)
+                    and not COUNTRY_RE.match(w) and not ADDR_RE.search(w)
+                    and not re.match(r'^[A-Z]\d{1,4}[A-Z]?$',w,re.I)
+                    and len(w)>1):
                 if not c: c=w
                 s=''  # always clear — single remaining word = city, not street
         elif len(words)>=2 and not c:
@@ -360,7 +371,10 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
                     rest_of_s=' '.join(words[:-1])
                     # Don't strip if the word already appears earlier (e.g. 'Ebene' in '9th Floor Ebene Tower Cybercity Ebene')
                     already_present=last.lower() in rest_of_s.lower()
-                    if re.match(r'^[A-ZÀ-ɏ]',last) and not re.match(r'^\d',last) and not COUNTRY_RE.match(last) and len(last)>1 and not already_present:
+                    if (re.match(r'^[A-ZÀ-ɏ]',last) and not re.match(r'^\d',last)
+                            and not COUNTRY_RE.match(last) and not ADDR_RE.search(last)
+                            and not re.match(r'^[A-Z]\d{1,4}[A-Z]?$',last,re.I)
+                            and len(last)>1 and not already_present):
                         c=last; s=rest_of_s.strip()
         # After city extraction, check again for postal (numeric or UK) at end of s
         if not p and s:
@@ -410,11 +424,14 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
         if COUNTRY_RE.search(part_stripped) and re.fullmatch(COUNTRY_RE.pattern,part_stripped,re.I):
             if not country: country=part_stripped
             continue
-        # Standalone city adjacent to geo part
+        # Standalone city adjacent to geo part or province/state part
         if is_city_part(part) and not city:
             nxt=i+1<len(parts) and has_geo(parts[i+1])
             prv=i>0 and has_geo(parts[i-1])
-            if nxt or prv: city=part; continue
+            # Also fire if next part is a state/province (e.g. 'Lahore, Punjab Province, Pakistan')
+            nxt_state=(i+1<len(parts) and STATE_KW.search(parts[i+1])
+                       and not ADDR_RE.search(parts[i+1]))
+            if nxt or prv or nxt_state: city=part; continue
         # Embedded country/postal/ISO
         has_c=bool(COUNTRY_RE.search(part)) and not ISO2_RE.match(part.strip())
         has_p=bool(re.search(r'\s\d{4,7}\.?\d*\s*$',part))
@@ -436,8 +453,13 @@ def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
                 if not postal: postal=m2.group(1)
                 if not city:   city=m2.group(2)
                 street_parts.append(part[:m2.start()].strip()); continue
-        # Last comma-part is a pure district/region → move to a2_add, not street
-        if (i == len(parts)-1 and STATE_KW.search(part)
+        # Last (or second-to-last before country) district/region → a2_add
+        _is_last_district = (
+            i == len(parts)-1 or
+            (i == len(parts)-2 and re.fullmatch(COUNTRY_RE.pattern,
+                parts[i+1].strip().rstrip('.,'), re.I))
+        )
+        if (_is_last_district and STATE_KW.search(part)
                 and not ADDR_RE.search(part) and not re.search(r'\d', part)):
             if not a2_add: a2_add = part
             continue
@@ -566,6 +588,84 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-address splitter
+# ─────────────────────────────────────────────────────────────────────────────
+def split_multi_address(a1):
+    """Split a multi-address field into list of (label, address) tuples.
+    Handles: Branch Office N:, Address N:, Labeled sections, a)/b)/c), semicolons.
+    Returns [(label_str, address_str), ...].
+    """
+    if not a1: return []
+    a1 = re.sub(
+        r'(?:Telephone|Tel|Phone|Fax|Mobile|Email|e-mail|Website|Web|www)'
+        r'[:\s][^\n;,]+[,;]?\s*', '', a1, flags=re.I).strip()
+
+    def _split_roman(text):
+        ROMAN = re.compile(r'\s*(?:;?\s*)?\b(i{1,4}v?|vi{0,3}|ix|x)\)\s*', re.I)
+        subs = ROMAN.split(text)
+        results = []
+        first = subs[0].strip().rstrip(';, ').strip()
+        if first and ',' in first:
+            results.append(first)
+        j = 2
+        while j < len(subs):
+            content = subs[j].strip().rstrip(';, ').strip()
+            if content:
+                results.append(content)
+            j += 2
+        return results if results else [text.strip()]
+
+    def _split_labeled(text, pat, sub_roman=False):
+        parts = pat.split(text)
+        results = []
+        i = 1
+        while i < len(parts) - 1:
+            label   = parts[i].strip()
+            content = parts[i+1].strip().rstrip(';, ').strip()
+            if sub_roman:
+                for addr in _split_roman(content):
+                    if addr.strip():
+                        results.append((label, addr.strip().rstrip(';, ').strip()))
+            else:
+                if content:
+                    results.append((label, content))
+            i += 2
+        return results
+
+    BRANCH = re.compile(r',?\s*(Branch\s+Office\s+\d+):\s*', re.I)
+    if BRANCH.search(a1):
+        return _split_labeled(a1, BRANCH, sub_roman=True)
+
+    ADDR_N = re.compile(
+        r',?\s*((?:Last\s+Known\s+)?(?:Residential\s+)?Address(?:es)?\s+\d+):\s*', re.I)
+    if ADDR_N.search(a1):
+        return _split_labeled(a1, ADDR_N, sub_roman=False)
+
+    LABELLED = re.compile(
+        r',?\s*((?:Registered|Primary|Secondary|Headquarters?|HQ|Principal|'
+        r'Incorporation|Former|Previous|Current)\s*(?:Address(?:es)?)?|'
+        r'Formerly?\s+(?:at|of)?):\s*', re.I)
+    if LABELLED.search(a1):
+        return _split_labeled(a1, LABELLED, sub_roman=False)
+
+    if re.search(r'(?:^|\n\n)[a-z]\)\s+\w', a1, re.I):
+        parts = re.split(r'\n\n(?=[a-z]\)\s)', a1, flags=re.I)
+        results = []
+        for p in parts:
+            p = re.sub(r'^[a-z]\)\s*', '', p.strip(), flags=re.I)
+            if p.strip():
+                results.append(('', p.strip().rstrip('; ').strip()))
+        return results
+
+    if ';' in a1:
+        subs = [s.strip().rstrip(', ').strip() for s in re.split(r';\s*', a1) if s.strip()]
+        if len(subs) >= 2 and all(',' in s or len(s.split()) >= 3 for s in subs):
+            return [('', s) for s in subs]
+
+    return [('', a1.strip())]
+
+
 st.title("🗺️ Address Cleaning Agent")
 st.caption("Upload any Excel or CSV — automatically extracts city, postal, country and routes each value to the correct column.")
 
@@ -643,6 +743,32 @@ if run:
             diffs.append({'Row':idx+1,'Field':C(field_key),'Before':before,'After':after})
     def setcol(idx, field_key, val):
         if C(field_key): df.at[idx, C(field_key)] = val
+
+
+    # ── Pre-process: expand multi-address rows ──────────────────────
+    if C('address'):
+        new_rows = []
+        drop_idx  = []
+        for idx, row in df.iterrows():
+            a1_raw = str(row.get(C('address'),'') or '').strip()
+            splits = split_multi_address(a1_raw)
+            if len(splits) > 1:
+                drop_idx.append(idx)
+                for label, addr in splits:
+                    new_row = row.copy()
+                    new_row[C('address')] = addr
+                    # Optionally store label in ADDRESS2 if it's empty
+                    if label and C('address2') and not str(new_row.get(C('address2'),'') or '').strip():
+                        new_row[C('address2')] = label
+                    new_rows.append(new_row)
+        if drop_idx:
+            df = df.drop(index=drop_idx)
+            if new_rows:
+                import pandas as _pd
+                expanded = _pd.DataFrame(new_rows)
+                df = _pd.concat([df, expanded], ignore_index=True)
+            total = len(df)
+            prog.progress(0, text=f"Expanded {len(drop_idx)} multi-address rows → {total:,} total rows…")
 
     for idx, row in df.iterrows():
         if idx % 1000 == 0:
