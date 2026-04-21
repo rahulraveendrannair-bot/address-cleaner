@@ -1,422 +1,1351 @@
-# Address Cleaning Agent (Enhanced)
-# ------------------------------------------------------------
-# Purpose:
-#   Streamlit app to clean global addresses, with strong support for
-#   "CITY./VILL./SETTLEMENT" prefix patterns as seen in add1.xlsx.
-#   Produces:
-#     - Cleaned Data (same columns as input + POSTAL_FLAG, DATA_QUALITY)
-#     - Changes Log (row/field/before/after)
-#
-# Notes:
-#   - Offline-first: no external API calls.
-#   - Deterministic rules: explicit country mentions override ambiguous city mappings.
-#   - Designed to reduce false country inference (e.g., Odessa -> US) by enforcing
-#     explicit-country-wins.
-# ------------------------------------------------------------
-
 import streamlit as st
 import pandas as pd
 import re
 import io
-from typing import Dict, Tuple, List
+from collections import defaultdict
 
-st.set_page_config(page_title="Address Cleaning Agent (Enhanced)", page_icon="🗺️", layout="wide")
+st.set_page_config(page_title="Address Cleaning Agent", page_icon="🗺️", layout="wide")
 
-# -------------------------------
-# Helpers
-# -------------------------------
+# ══════════════════════════════════════════════════════════════════
+# CLEANING ENGINE
+# Rules learned from Raw/Cleaned example data
+# ══════════════════════════════════════════════════════════════════
 
-def norm_ws(x) -> str:
-    if x is None:
-        return ""
-    try:
-        if pd.isna(x):
-            return ""
-    except Exception:
-        pass
-    s = str(x)
-    s = s.replace("\u00a0", " ")
-    s = re.sub(r"[\t\r\n]+", " ", s)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
-
-
-def safe_upper(s: str) -> str:
-    return norm_ws(s).upper()
-
-
-# -------------------------------
-# Core rule sets (enhancements)
-# -------------------------------
-
-# Prefixes seen in datasets like add1.xlsx
-PREFIX_LOCALITY_RE = re.compile(
-    r"^\s*(CITY|CIT|VILL|VILLAGE|SETTLEMENT|N\.P|N\.P\.|NP|TOWN|CITY,)\.?\s*[:\-]?\s*",
-    re.I,
+COUNTRY_RE = re.compile(
+    r'\b(Russia|Russian Federation|China|United Kingdom|England|Scotland|'
+    r'Northern Ireland|UK|United States|United States of America|USA|Germany|'
+    r'France|Ukraine|India|Iran|Iraq|Syria|Turkey|Türkiye|Japan|South Korea|'
+    r'North Korea|Myanmar|Malaysia|Indonesia|Pakistan|Egypt|Switzerland|'
+    r'Netherlands|Belgium|Italy|Spain|Portugal|Greece|Poland|Romania|Bulgaria|'
+    r'Hungary|Czech Republic|Austria|Sweden|Norway|Denmark|Finland|Ireland|'
+    r'Luxembourg|Cyprus|Serbia|Croatia|Belarus|Kazakhstan|Azerbaijan|Armenia|'
+    r'Georgia|Moldova|Singapore|Hong Kong|Taiwan|Philippines|Bangladesh|'
+    r'Afghanistan|Uzbekistan|Vietnam|Thailand|Cambodia|Nigeria|Kenya|'
+    r'South Africa|Ethiopia|Sudan|Yemen|Qatar|Kuwait|Oman|Bahrain|Jordan|'
+    r'Lebanon|Israel|Saudi Arabia|United Arab Emirates|Canada|Mexico|Brazil|'
+    r'Argentina|Venezuela|Colombia|Peru|Chile|Bolivia|Australia|New Zealand|'
+    r'Libya|Tunisia|Morocco|Algeria|Palestine|Syrian Arab Republic|Palestinian Territor(?:y|ies)|Occupied Palestinian Territories|Seychelles|'
+    r'Latvia|Monaco|Marshall Islands|Laos|Kyrgyzstan|Tajikistan|Turkmenistan|'
+    r'Macau|Albania|Montenegro|Bosnia|Slovenia|Slovakia|Estonia|Lithuania|'
+    r'Malta|Iceland|Kosovo|Honduras|Guyana|Uganda|Tanzania|Ghana|Senegal|'
+    r'Ecuador|Paraguay|Uruguay|Nepal|Sri Lanka|Cuba|Dominican Republic|Mauritius|Republic of Mauritius|Cayman Islands|British Virgin Islands|Isle of Man|Bermuda|Jersey|Guernsey|Panama|Costa Rica|Trinidad and Tobago|Jamaica|Barbados|Bahamas|Belize|Fiji|Papua New Guinea|Kingdom|Emirates|Korea|Arabia|Zealand|Republic of Korea|Democratic Republic|Unitied Kingdom|Untied Kingdom|United-Kingdom|'
+    r"Democratic People's Republic of Korea|DPRK|SYRIE|PHILIPPINES)\b",
+    re.I
 )
 
-# Administrative noise that should never become CITY
-ADMIN_NOISE_RE = re.compile(r"\b(ASSR|SSR|USSR)\b;?", re.I)
+ADDR_RE = re.compile(
+    r'\b(Street|St\b|Avenue|Ave\b|Road|Rd\b|Lane|Drive|Blvd|Floor|Suite|'
+    r'Block|No\b|Ulitsa|Dom\b|Korpus|Etazh|Prospekt|Pereulok|Nabereznaya|'
+    r'Shosse|Mahallesi|Cad\b|Sok\b|Jalan|Room|Unit|Bldg|Building|Apt\b|'
+    r'Plaza|Tower|Center|Centre|Park|Square|Close|Court|Crescent|Grove|'
+    r'Way\b|Walk\b|Hill\b|Gate\b|Gardens|Terrace|Heights|Manor|House\b|'
+    r'Chemin|Rue\b|Boulevard|Weg\b|Gasse|Platz|Allee|Zona|Promyshlennaya|'
+    r'ul\b|d\b(?=\s*\d)|Str\b|Mah\b|Blok\b|Kat\b|Daire\b|Pasa\b|'
+    r'Warehouse|Office|Factory|Logistics|Industrial|Complex|Terminal|Hub|'
+    r'P\.O\.|PO Box|P O Box|Post Office Box|'
+    r'Junction|Interchange|Roundabout|Bypass|Flyover|Overpass)'
+    r'|strasse\b|straße\b|gasse\b|\bplatz\b',
+    re.I
+)
 
-# Protect Saint cities so they don't get split into ST. + PETERSBURG
-SAINT_FIX_RE = re.compile(r"\bST\.\s*(PETERSBURG|LOUIS|PAUL|HELENS)\b", re.I)
+STATE_KW = re.compile(
+    r'\b(Oblast|Krai|Kray|Okrug|Republic|Autonomous|Rayon|Raion|Province|'
+    r'Region|Territory|County|Prefecture|Governorate|Penzenskaya|'
+    r'Novosibirskaya|Volgogradskaya|Saratovskaya|Township|Borough|Parish|'
+    r'District|Division|Department|Canton|Voivodeship|Shire|Emirate|'
+    r'Muhafazah|Wilayat|Banteay|Commune|Arrondissement)\b',
+    re.I
+)
 
-# General junk city tokens
-JUNK_CITY = {"ASSR", "SSR", "USSR", "REGION", "DISTRICT", "OBLAST", "KRAI", "KRAY", "REPUBLIC"}
+TOWNSHIP_RE = re.compile(r'\b\w[\w\s\-]*Township\b', re.I)
 
-# Explicit country detection: explicit mention always wins
-EXPLICIT_COUNTRY_HINTS: List[Tuple[re.Pattern, str, str]] = [
-    (re.compile(r"\bUKRAINE\b|\bUKRAINIAN\b", re.I), "UA", "Ukraine"),
-    (re.compile(r"\bREPUBLIC OF AZERBAIJAN\b|\bAZERBAIJAN\b", re.I), "AZ", "Azerbaijan"),
-    (re.compile(r"\bBELARUS\b", re.I), "BY", "Belarus"),
-    (re.compile(r"\bTAJIKISTAN\b", re.I), "TJ", "Tajikistan"),
-    (re.compile(r"\bUZBEKISTAN\b", re.I), "UZ", "Uzbekistan"),
-    (re.compile(r"\bKAZAKHSTAN\b", re.I), "KZ", "Kazakhstan"),
-    (re.compile(r"\bRUSSIAN FEDERATION\b|\bRUSSIA\b|\bRSFSR\b", re.I), "RU", "Russia"),
-    (re.compile(r"\bCOTE\s*[- ]?IVOIRE\b|\bCÔTE\s*D['’]IVOIRE\b", re.I), "CI", "Côte d'Ivoire"),
-]
+DISTRICT_RE = re.compile(
+    r'\b(\w[\w\s\-]+(?:District|Qu\b|gu\b|dong\b|guyok\b|Ward\b|'
+    r'Quarter\b|Arrondissement\b))\b', re.I
+)
 
-# Ambiguity guards: Odessa exists in multiple countries; if text indicates Ukraine, force UA.
-AMBIG_CITY_OVERRIDES = {
-    "odessa": (re.compile(r"\bODESSA\b.*\bUKRAINE\b|\bODESSA REGION\b.*\bUKRAINE\b", re.I), "UA", "Ukraine"),
+TERRITORY_RE = re.compile(
+    r',?\s*\b(West Bank|Northern Gaza|Gaza Strip|Gaza|Crimea)\b\s*,?', re.I
+)
+
+JUNK_POSTAL = re.compile(r'^(XX|00000|0{4,}|N/A|NA|None|null|TBD)$', re.I)
+NOTE_RE     = re.compile(
+    r'^(Linked To:|Address redacted|Unknown|Located in|Resident in|'
+    r'Trust Company Complex|Letter )', re.I
+)
+ISO2_RE    = re.compile(r'^[A-Z]{2}$')
+UK_POST_RE = re.compile(r'\b([A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9][A-Z]{2})\b', re.I)
+
+US_STATES = {
+    'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN',
+    'IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV',
+    'NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN',
+    'TX','UT','VT','VA','WA','WV','WI','WY','DC'
+}
+CA_PROVS = {'AB','BC','MB','NB','NL','NS','NT','NU','ON','PE','QC','SK','YT'}
+
+US_STATE_EXPAND = {
+    'AL':'Alabama','AK':'Alaska','AZ':'Arizona','AR':'Arkansas','CA':'California',
+    'CO':'Colorado','CT':'Connecticut','DE':'Delaware','FL':'Florida','GA':'Georgia',
+    'HI':'Hawaii','ID':'Idaho','IL':'Illinois','IN':'Indiana','IA':'Iowa',
+    'KS':'Kansas','KY':'Kentucky','LA':'Louisiana','ME':'Maine','MD':'Maryland',
+    'MA':'Massachusetts','MI':'Michigan','MN':'Minnesota','MS':'Mississippi',
+    'MO':'Missouri','MT':'Montana','NE':'Nebraska','NV':'Nevada','NH':'New Hampshire',
+    'NJ':'New Jersey','NM':'New Mexico','NY':'New York','NC':'North Carolina',
+    'ND':'North Dakota','OH':'Ohio','OK':'Oklahoma','OR':'Oregon','PA':'Pennsylvania',
+    'RI':'Rhode Island','SC':'South Carolina','SD':'South Dakota','TN':'Tennessee',
+    'TX':'Texas','UT':'Utah','VT':'Vermont','VA':'Virginia','WA':'Washington',
+    'WV':'West Virginia','WI':'Wisconsin','WY':'Wyoming','DC':'District of Columbia'
+}
+CA_PROV_EXPAND = {
+    'AB':'Alberta','BC':'British Columbia','MB':'Manitoba','NB':'New Brunswick',
+    'NL':'Newfoundland and Labrador','NS':'Nova Scotia','NT':'Northwest Territories',
+    'NU':'Nunavut','ON':'Ontario','PE':'Prince Edward Island','QC':'Quebec',
+    'SK':'Saskatchewan','YT':'Yukon'
 }
 
-# Country normalization (keep minimal; extend as needed)
-COUNTRY_NAME_TO_ISO2 = {
-    "ukraine": "UA",
-    "azerbaijan": "AZ",
-    "belarus": "BY",
-    "tajikistan": "TJ",
-    "uzbekistan": "UZ",
-    "kazakhstan": "KZ",
-    "russia": "RU",
-    "côte d'ivoire": "CI",
-    "cote d'ivoire": "CI",
+COUNTRY_NORMALIZE = {'russia': 'Russia', 'china': 'China', 'myanmar [burma]': 'Myanmar', 'united kingdom': 'UNITED KINGDOM', 'poland': 'POLAND', 'brazil': 'Brazil', 'united states': 'United States', 'england': 'UNITED KINGDOM', 'bosnia and herzegovina': 'Bosnia and Herzegovina', 'ukraine': 'Ukraine', 'republic of türkiye': 'Turkey', 'venezuela': 'Venezuela', 'mali': 'Mali', 'bangladesh': 'Bangladesh', 'egypt': 'Egypt', 'mongolia': 'Mongolia', 'iran': 'Iran', 'turkey': 'Turkey', 'hong kong': 'Hong Kong', 'united arab emirates': 'United Arab Emirates', 'france': 'France', 'myanmar': 'Myanmar', 'india': 'India', 'spain': 'Spain', 'cambodia': 'Cambodia', 'singapore': 'Singapore', 'belarus': 'Belarus', 'nigeria': 'Nigeria', 'senegal': 'Senegal', 'equatorial guinea': 'Equatorial Guinea', 'latvia': 'Latvia', 'tajikistan': 'Tajikistan', 'kosovo': 'Kosovo', 'northern ireland': 'UNITED KINGDOM', 'malta': 'Malta', 'congo (democratic republic)': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'iraq': 'Iraq', 'notk': 'Iran', 'viet nam': 'Vietnam', 'cyprus': 'Cyprus', 'liberia': 'Liberia', 'south korea': 'South Korea', 'pakistan': 'Pakistan', 'azerbaijan': 'Azerbaijan', 'taiwan': 'Taiwan', 'moldova': 'Moldova', 'canada': 'Canada', 'syria': 'Syria', 'syrian arab republic': 'Syria', 'kyrgyz republic': 'KYRGYZSTAN', 'tunisia; libya': 'Tunisia', 'occupied palestinian territories': 'Palestine', 'malaysia': 'Malaysia', 'wales': 'UNITED KINGDOM', 'puerto rico': 'Puerto Rico', 'indonesia': 'Indonesia', 'guatemala': 'Guatemala', 'bolivia': 'Bolivia', 'colombia': 'Colombia', 'scotland': 'UNITED KINGDOM', 'sierra leone': 'Sierra Leone', 'nepal': 'Nepal', 'saudi arabia': 'Saudi Arabia', 'north macedonia': 'North Macedonia', 'turkiye': 'Turkiye', 'cayman islands': 'Cayman Islands', 'namibia': 'NAMIBIA', 'sweden': 'Sweden', 'uk': 'UNITED KINGDOM', 'central african republic': 'Central African Republic', 'bermuda': 'Bermuda', 'argentina': 'Argentina', 'korea, republic of': 'SOUTH KOREA', 'denmark': 'Denmark', 'peru': 'Peru', 'congo, republic of': 'Congo, Republic of the', 'sri lanka': 'Sri Lanka', 'serbia': 'Serbia', 'saint kitts and nevis': 'ST. KITTS & NEVIS', 'eswatini': 'Eswatini', 'uganda': 'Uganda', "lao people's democratic republic": 'LAOS', 'palestinian territories': 'Palestinian Territories', 'nicaragua': 'Nicaragua', 'ireland': 'Ireland', 'israel': 'Israel', 'netherlands': 'Netherlands', 'uzbekistan': 'Uzbekistan', 'kyrgyzstan': 'Kyrgyzstan', 'estonia': 'Estonia', 'ecuador': 'Ecuador', 'switzerland': 'Switzerland', 'south africa': 'South Africa', 'bahamas, the': 'BAHAMAS', 'south sudan': 'South Sudan', 'georgia': 'Georgia', 'tunisia': 'Tunisia', 'sudan': 'Sudan', 'thailand': 'Thailand', 'mauritius': 'Mauritius', 'republic of mauritius': 'Mauritius',
+    'kingdom': 'United Kingdom', 'unitied kingdom': 'United Kingdom',
+    'untied kingdom': 'United Kingdom', 'united-kingdom': 'United Kingdom',
+    'great britain': 'United Kingdom', 'great britain.': 'United Kingdom',
+    'emirates': 'United Arab Emirates', 'uae': 'United Arab Emirates',
+    'kingdom of saudi arabia': 'Saudi Arabia', 'ksa': 'Saudi Arabia',
+    'arabia': 'Saudi Arabia',
+    'new zealand': 'New Zealand', 'zealand': 'New Zealand',
+    'south africa': 'South Africa', 'korea': 'North Korea',
+    'russian federation': 'Russia', 'republic of dagestan': 'Russia', 'republic of chechnya': 'Russia', 'chechen republic': 'Russia', 'republic of tatarstan': 'Russia', 'republic of bashkortostan': 'Russia', 'republic of mordovia': 'Russia', 'republic of mari el': 'Russia', 'republic of udmurtia': 'Russia', 'republic of kalmykia': 'Russia', 'republic of karachay-cherkessia': 'Russia', 'republic of kabardino-balkaria': 'Russia', 'republic of north ossetia-alania': 'Russia', 'republic of ingushetia': 'Russia', 'republic of sakha': 'Russia', 'republic of buryatia': 'Russia', 'republic of tuva': 'Russia', 'republic of khakasia': 'Russia', 'republic of karelia': 'Russia', 'republic of altai': 'Russia', 'federation': 'Russia', 'republique de maurice': 'Mauritius', 'maurice': 'Mauritius', 'vietnam': 'Vietnam', 'iraq; iraq': 'IRAQ', '141313': 'Russia', 'qatar': 'QATAR', 'congo [drc]': 'Congo [DRC]', 'gaza strip': 'PALESTINE (WEST BANK-GAZA)', 'albania': 'Albania', 'chile': 'Chile', 'finland': 'Finland', 'kenya': 'Kenya', 'india 208002': 'INDIA', 'gbr': 'UNITED KINGDOM', 'jordan': 'Jordan', 'austria': 'Austria', 'australia': 'Australia', 'slovakia': 'Slovakia', 'germany': 'Germany', 'lebanon': 'Lebanon', 'british virgin islands': 'British Virgin Islands', 'korea, north': 'Korea, North', 'russian federation': 'Russia', 'hungary': 'Hungary', "côte d'ivoire": "Côte d'Ivoire", 'hong kong sar, china': 'China', 'seychelles': 'Seychelles', 'philippines': 'Philippines', 'malawi': 'Malawi', 'libya': 'Libya', 'abkhazia': 'Georgia', 'portugal': 'Portugal', 'mexico': 'Mexico', 'virgin islands, british': 'Virgin Islands, British', 'kuwait': 'Kuwait', 'indonesia; indonesia': 'Indonesia', 'panama': 'Panama', 'aruba': 'Aruba', 'costa rica': 'COSTA RICA', 'romania': 'Romania', 'chad': 'Chad', 'italy': 'Italy', 'méxico.': 'Mexico', 'mauritania': 'Mauritania', 'kazakhstan': 'Kazakhstan', 'japan': 'Japan', 'ghana': 'Ghana', 'belize': 'Belize', 'guyana': 'Guyana', 'pakistan; afghanistan': 'Pakistan', 'guinea': 'GUINEA', 'armenia': 'Armenia', 'czech republic': 'Czech Republic', 'fiji': 'Fiji', 'el salvador': 'El Salvador', 'iraq; iraq; syrian arab republic': 'Iraq', 'mozambique': 'Mozambique', 'algeria': 'Algeria', 'uruguay': 'Uruguay', 'irn': 'IRAN', 'angola': 'Angola', 'bulgaria': 'Bulgaria', 'belgium': 'Belgium', 'tunisia; syrian arab republic; iraq; libya': 'Tunisia', 'macedonia [fyrom]': 'NORTH MACEDONIA', 'russian federation; syrian arab republic; iraq': 'Russian Federation', 'cameroon': 'Cameroon', 'tanzania': 'Tanzania', 'slovenia': 'Slovenia', 'st. lucia': 'St. Lucia', 'congo, democratic republic of': 'Congo, Republic of', 'pakistan; pakistan; pakistan; pakistan; pakistan; pakistan; afghanistan; afghanistan; afghanistan; united arab emirates; iran (islamic republic of)': 'PAKISTAN', 'trinidad and tobago': 'Trinidad and Tobago', 'bosnia and herzegovina; bosnia and herzegovina; bosnia and herzegovina; bosnia and herzegovina': 'BOSNIA & HERZEGOVINA', 'afghanistan': 'Afghanistan', 'norway': 'Norway', 'iran, islamic republic of': 'Iran', 'benin': 'Benin', 'haiti': 'Haiti', 'lithuania': 'LITHUANIA', 'peoples democratic republic of korea': 'North Korea', 'north korea': 'North Korea', 'honduras': 'Honduras', 'luxembourg': 'Luxembourg', 'pakistan; pakistan': 'PAKISTAN', 'monaco': 'Monaco', 'netherlands 9932ja': 'NETHERLANDS', 'goa': 'INDIA', 'laos': 'Laos', 'republic of korea': 'South Korea', 'united states of america; united states of america': 'UNITED STATES OF AMERICA', 'ethiopia': 'Ethiopia', 'germany; türkiye': 'Germany', 'liechtenstein': 'Liechtenstein', 'new zealand': 'New Zealand', 'syrian arab republic; turkey; trinidad and tobago; trinidad and tobago': 'Syria', 'madagascar': 'Madagascar', 'togo': 'TOGO (THE TOGOLESE REPUBLIC)', 'united states of america; united states of america; united states of america; united states of america; sudan; bangladesh; yemen': 'UNITED STATES OF AMERICA', 'tunisia; afghanistan': 'Tunisia', 'greece': 'GREECE', 'philippines; philippines; philippines': 'PHILIPPINES', 'selangor malaysia': 'MALAYSIA', 'hong kong sar china': 'Hong Kong', 'united republic of tanzania; united republic of tanzania; united republic of tanzania': 'TANZANIA', 'pakistan; pakistan; pakistan': 'Pakistan', 'switzerland, 4070': 'Switzerland', 'malaysia; malaysia; malaysia; syrian arab republic': 'Malaysia', 'italy; italy': 'Italy', 'the bahamas': 'The Bahamas', 'zambia': 'Zambia', 'somalia, federal republic of': 'Somalia', 'bosnia and herzegovina; bosnia and herzegovina; bosnia and herzegovina; bosnia and herzegovina; bosnia and herzegovina': 'BOSNIA & HERZEGOVINA', 'afghanistan; afghanistan; afghanistan': 'Afghanistan', 'cuba': 'Cuba', 'philippines; philippines': 'Philippines', 'philippines; philippines; syrian arab republic': 'Philippines', 'mali; algeria': 'Mali', 'pakistan; kuwait; united arab emirates; afghanistan': 'PAKISTAN', 'taiwan, china': 'Taiwan', 'pakistan; pakistan; pakistan; afghanistan': 'Pakistan', 'bosnia \\& herzegovina': 'BOSNIA \\& HERZEGOVINA', 'usa': 'United States', 'cymru': 'UNITED KINGDOM', 'zimbabwe': 'Zimbabwe', 'somalia': 'Somalia', 'burkina faso': 'Burkina Faso', 'afghanistan; pakistan': 'AFGHANISTAN', 'afghanistan, pakistan': 'Afghanistan', 'pakistan, afghanistan': 'Pakistan', 'turkish republic of northern cyprus': 'Cyprus', 'algeria; algeria': 'Algeria', 'rwanda': 'Rwanda', 'morocco': 'Morocco', 'malaysia; malaysia': 'Malaysia', 'congo [republic]': 'CONGO (REPUBLIC OF THE)', 'the gambia': 'GAMBIA', 'yemen': 'Yemen'}
+COUNTRY_TO_CODE = {'lebanon': 'LB', 'russia': 'RU', 'china': 'CN', 'iran': 'IR', 'myanmar': 'MM', 'united kingdom': 'GB', 'ukraine': 'UA', 'poland': 'PL', 'brazil': 'BR', 'united states': 'US', 'iraq': 'IQ', 'russian federation': 'RU', 'croatia': 'HR', 'congo (democratic republic of the)': 'CD', 'bosnia & herzegovina': 'BA', 'north korea': 'KP', 'australia': 'AU', 'malaysia': 'MY', 'turkey': 'TR', 'belarus': 'BY', 'venezuela': 'VE', 'india': 'IN', 'italy': 'IT', 'vanuatu': 'VU', 'cyprus': 'CY', 'mali': 'ML', 'marshall islands': 'MH', 'myanmar [burma]': 'MM', 'hong kong': 'HK', 'bangladesh': 'BD', 'cuba': 'CU', 'qatar': 'QA', 'philippines': 'PH', 'canada': 'CA', 'palestine': 'PS', 'united states of america': 'US', 'egypt': 'EG', 'mongolia': 'MN', 'mauritius': 'MU', 'switzerland': 'CH', 'nicaragua': 'NI', 'saint vincent and the grenadines': 'VC', 'united arab emirates': 'AE', 'syria': 'SY', 'syrian arab republic': 'SY', 'kosovo': 'KV', 'angola': 'AO', 'afghanistan': 'AF', 'new zealand': 'NZ', 'saudi arabia': 'SA', 'pakistan': 'PK', 'tunisia': 'TN', 'northern ireland (united kingdom)': 'XI', 'thailand': 'TH', 'france': 'FR', 'libya': 'LY', 'honduras': 'HN', 'peru': 'PE', 'bosnia and herzegovina': 'BA', 'republic of türkiye': 'TR', "democratic people's republic of korea": 'KP', 'algeria': 'DZ', 'kenya': 'KE', 'el salvador': 'SV', 'kazakhstan': 'KZ', 'costa rica': 'CR', 'trinidad and tobago': 'TT', 'yemen': 'YE', 'sweden': 'SE', 'belgium': 'BE', 'jordan': 'JO', 'kuwait': 'KW', 'spain': 'ES', 'haiti': 'HT', 'indonesia': 'ID', 'cambodia': 'KH', 'germany': 'DE', 'singapore': 'SG', 'central african republic': 'CF', 'democratic people’s republic of korea': 'KP', 'union of the comoros': 'KM', 'ecuador': 'EC', 'maldives': 'MV', 'nigeria': 'NG', 'senegal': 'SN', 'democratic republic of the congo': 'CD', 'mexico': 'MX', 'equatorial guinea': 'GQ', 'latvia': 'LV', 'tajikistan': 'TJ', 'azerbaijan': 'AZ', 'malta': 'MT', 'ghana': 'GH', 'japan': 'JP', 'denmark': 'DK', 'sri lanka': 'LK', 'kyrgyzstan': 'KG', 'south sudan': 'SS', 'uganda': 'UG', 'burma': 'MM', 'vietnam': 'VN', 'moldova': 'MD', "côte d'ivoire": 'CI', 'south africa': 'ZA', 'liberia': 'LR', 'colombia': 'CO', 'south korea': 'KR', 'taiwan': 'TW', 'norway': 'NO', 'austria': 'AT', 'somalia': 'SO', 'uzbekistan': 'UZ', 'palestine (west bank-gaza)': 'PS', 'puerto rico': 'PR', 'nepal': 'NP', 'seychelles': 'SC', 'guatemala': 'GT', 'bolivia': 'BO', 'netherlands': 'NL', 'panama': 'PA', 'sierra leone': 'SL', 'ireland': 'IE', 'uruguay': 'UY', 'north macedonia': 'MK', 'cayman islands': 'KY', 'st. lucia': 'LC', 'british virgin island': 'VG', 'dominican republic': 'DO', 'bermuda': 'BM', 'laos': 'LA', 'argentina': 'AR', 'slovak republic': 'SK', 'rwanda': 'RW', 'monaco': 'MC', 'congo (democratic republic)': 'CD', 'congo, republic of the': 'CG', 'congo (republic of the)': 'CG', 'serbia': 'RS', 'afganistan': 'AF', 'afghanistan; pakistan': 'AF', 'afghanistan, pakistan': 'AF', 'pakistan, afghanistan': 'PK', 'st. kitts & nevis': 'KN', 'greece': 'GR', 'democratic republic of congo': 'CD', 'st. vincent and grenadines': 'VC', "democratic people's republic of korea (dprk)": 'KP', 'bahrain': 'BH', 'eswatini': 'SZ', 'syrian arab republic': 'SY', 'sudan': 'SD', 'palestinian territories': 'PS', 'occupied palestinian territories': 'PS', 'occupied palestinian territory': 'PS', 'palestinian territory': 'PS', 'state of palestine': 'PS', 'palestine (west bank-gaza)': 'PS', 'israel': 'IL', 'estonia': 'EE', 'bahamas': 'BS', 'united kngdom': 'GB', 'st. vincent and the grenadines': 'VC', 'bulgaria': 'BG', 'eritrea': 'ER', 'luxembourg': 'LU', 'finland': 'FI', 'georgia': 'GE', 'djibouti': 'DJ', 'türkiye': 'TR', 'chad': 'TD', 'russia federation': 'RU', 'phillippines': 'PH', 'kyrgyz republic': 'KG', "korea, democratic people's republic of": 'KP', 'morocco': 'MA', 'the gambia': 'GM', 'malawi': 'MW', 'czech republic': 'CZ', 'oman': 'OM', 'congo [drc]': 'CD', 'tanzania': 'TZ', 'gaza strip': 'PS', 'turkiye': 'TR', 'liechtenstein': 'LI', 'korea, democratic peoples republic of': 'KP', 'ethiopia': 'ET', 'albania': 'AL', 'madagascar': 'MG', 'chile': 'CL', 'guernsey': 'GG', 'comoros': 'KM', 'dominica': 'DM', 'jamaica': 'JM', 'korea, south': 'KR', 'guinea': 'GN', 'slovakia': 'SK', 'lithuania': 'LT', 'british virgin islands': 'VG', 'korea, north': 'KP', 'hungary': 'HU', 'samoa': 'WS', 'congo (democratic republic of the cong': 'CD', 'isle of man': 'IM', 'cote d ivoire': 'CI', 'burundi': 'BI', 'england': 'GB', 'suriname': 'SR', 'mozambique': 'MZ', 'romania': 'RO', 'armenia': 'AM', 'cameroon': 'CM', 'portugal': 'PT', 'guyana': 'GY', 'belize': 'BZ', 'slovenia': 'SI', 'virgin islands, british': 'VG', 'togo (the togolese republic)': 'TG', 'congo republic of the': 'CG', 'northern ireland': 'XI', 'aruba': 'AW', 'jersey': 'JE', 'viet nam': 'VN', 'botswana': 'BW', 'mauritania': 'MR', 'papua new guinea': 'PG', 'mexcico': 'MX', 'togo': 'TG', 'fiji': 'FJ', 'saint kitts and nevis': 'KN', 'saint lucia': 'LC', 'zambia': 'ZM', 'congo': 'CD', 'montenegro': 'ME', 'tonga': 'TO', 'benin': 'BJ', 'republic of tajikistan': 'TJ', 'gambia': 'GM', 'congo, republic of': 'CD', 'chna': 'CN', 'paraguay': 'PY', 'switzerlandcc': 'CH', 'solomon islands': 'SB', 'north carolina': 'NC', 'unknown': 'XX', 'zimbabwe': 'ZW', 'trukey': 'TR', 'republic of turkiye': 'TR', 'iceland': 'IS', 'barbados': 'BB', 'grenada': 'GD', 'anguilla': 'AI', 'burma (myanmar)': 'MM', 'notk': 'XX', 'ivory coast': 'CI', 'the bahamas': 'BS', 'st vincent and the grenadines': 'CV', 'europe': 'EU', 'loas': 'LA', "lao people's democratic republic": 'LA', 'brunei': 'BN', 'syiria': 'SY', 'dprk': 'KP', 'republic of uzbekistan': 'UZ', 'cape verde': 'CV', 'palestine (west bank-gaza)q': 'PS', 'unitied kingdom': 'GB', 'libyan arab jamahiriya': 'LY', 'sta. lucia': 'LC', 'niger': 'NE', 'iran,': 'IR', 'democratic republic of the cong': 'CD', 'st. vincent and grenadine': 'VC', 'united ,kingdom': 'GB', "emocratic people's republic of korea": 'KP', "cote d'ivoire": 'CI', 'burkina faso': 'BF', 'united states virgin islands': 'VI', 'hong kong special administrative region': 'HK', 'lao peoples democratic republic': 'LA', 'antigua and barbuda': 'AG', 'bosnia \\& herzegovina': 'BA', 'congo, democratic rep. of': 'CD', 'republic of vanuatu': 'VU', 'sint maarten (dutch part)': 'SX', 'republic of the congo': 'CD', 'indian': 'IN', 'republic of congo': 'CG', 'congo (democratic republic of)': 'CD', 'korea, republic of': 'KR', 'republic of azerbaijan': 'AZ', 'south libya': 'LY', 'macedonia [fyrom]': 'MK', 'iowa': 'IA', 'great britain': 'GB', 'ecuatorial guinea': 'GQ', 'congo, democratic republic of': 'CD'}
+ISO_TO_COUNTRY = {
+    'RU':'Russia','CN':'China','US':'United States','GB':'United Kingdom',
+    'DE':'Germany','FR':'France','UA':'Ukraine','IN':'India','IR':'Iran',
+    'SY':'Syria','IQ':'Iraq','KP':'North Korea','KR':'South Korea',
+    'JP':'Japan','TR':'Turkey','SA':'Saudi Arabia','AE':'United Arab Emirates',
+    'PK':'Pakistan','MM':'Myanmar','TH':'Thailand','VN':'Vietnam',
+    'MY':'Malaysia','ID':'Indonesia','SG':'Singapore','HK':'Hong Kong',
+    'TW':'Taiwan','BY':'Belarus','KZ':'Kazakhstan','CH':'Switzerland',
+    'AT':'Austria','NL':'Netherlands','SE':'Sweden','NO':'Norway',
+    'DK':'Denmark','FI':'Finland','IE':'Ireland','PT':'Portugal',
+    'ES':'Spain','IT':'Italy','GR':'Greece','IL':'Israel','EG':'Egypt',
+    'CA':'Canada','AU':'Australia','NZ':'New Zealand','BR':'Brazil',
+    'AR':'Argentina','VG':'British Virgin Islands','IM':'Isle of Man',
+    'BM':'Bermuda','PS':'Palestinian Territory','RO':'Romania',
+    'BG':'Bulgaria','PL':'Poland','LU':'Luxembourg','CY':'Cyprus',
+    'BE':'Belgium','YE':'Yemen','QA':'Qatar','KW':'Kuwait','OM':'Oman',
+    'BH':'Bahrain','JO':'Jordan','LB':'Lebanon','MX':'Mexico',
+    'CL':'Chile','BO':'Bolivia','HN':'Honduras','GY':'Guyana',
+    'AF':'Afghanistan','BD':'Bangladesh','PH':'Philippines','LK':'Sri Lanka',
+    'NP':'Nepal','GE':'Georgia','AZ':'Azerbaijan','AM':'Armenia',
+    'MD':'Moldova','RS':'Serbia','HR':'Croatia','CZ':'Czech Republic',
+    'HU':'Hungary','AL':'Albania','ME':'Montenegro','SI':'Slovenia',
+    'SK':'Slovakia','MT':'Malta','IS':'Iceland','XK':'Kosovo',
+    'NG':'Nigeria','KE':'Kenya','ZA':'South Africa','ET':'Ethiopia',
+    'SD':'Sudan','TZ':'Tanzania','UG':'Uganda','GH':'Ghana',
+    'SN':'Senegal','EC':'Ecuador','CU':'Cuba','DO':'Dominican Republic',
+    'PY':'Paraguay','UY':'Uruguay',
 }
-ISO2_TO_COUNTRY = {
-    "UA": "Ukraine",
-    "AZ": "Azerbaijan",
-    "BY": "Belarus",
-    "TJ": "Tajikistan",
-    "UZ": "Uzbekistan",
-    "KZ": "Kazakhstan",
-    "RU": "Russia",
-    "CI": "Côte d'Ivoire",
+
+TERRITORY_TO_COUNTRY = {
+    'west bank':'Palestinian Territory',
+    'northern gaza':'Palestinian Territory',
+    'gaza strip':'Palestinian Territory',
+    'gaza':'Palestinian Territory',
+    'crimea':'Russia',
 }
 
-# Postal validation (basic; country-aware)
-POSTAL_RE = {
-    "US": re.compile(r"^\d{5}(-\d{4})?$", re.I),
-    "GB": re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$", re.I),
-    "CA": re.compile(r"^[A-Z]\d[A-Z]\s*\d[A-Z]\d$", re.I),
-    "IN": re.compile(r"^\d{6}$", re.I),
-    "RU": re.compile(r"^\d{6}$", re.I),
-    "UA": re.compile(r"^\d{5}$", re.I),
-    "AZ": re.compile(r"^[A-Z]{2}\d{4}$|^\d{4}$", re.I),
-    "BY": re.compile(r"^\d{6}$", re.I),
-    "TJ": re.compile(r"^\d{6}$", re.I),
-    "UZ": re.compile(r"^\d{6}$", re.I),
-    "KZ": re.compile(r"^\d{6}$", re.I),
-}
+KNOWN_STATES = {'mn', 'tasmania', 'county tyrone', 'southampton', 'nizhegorodskaya oblast', 'yunnan province', 'paktia', 'jiangxi', 'tehsil', 'istanbul province', 'xinjiang province', 'mordovia', 'occupied palestinian territories', 'herat province', 'baja california', 'karnataka', 'bursa', 'cirebon', 'kachin state', 'the autonomous island of anjouan union of comoros', 'hatay', 'puerto rico', 'nidwalden', 'selkirkshire', 'eastern mindanao', 'chekyabinsk oblast', 'barcelona', 'wenchuan county', 'palm jum eirah', 'gilan', 'xinjiang uyghur autonomous region', 'lvivska oblast', 'guangdong province', 'hà nam', 'lesnoy', 'ulyanovsk region', 'colorado', 'alicante', 'western bahr el ghazal', 'tver oblast', 'smolensk', 'kish island', 'kolkata', 'kandahar i̇li', 'kamchatski krai', 'merseyside', 'altay republic', 'leicestershire', 'tulskaya obl.', 'guannan county', 'worcester', 'xuanen county', 'zabol province', 'west yorkshire', 'hounslow', 'la convención', 'sverdlov oblast', 'southern shan state', 'al asimah governorate', 'ciudad real', 'saratov oblast', 'irkutskaya oblast', 'dodoma region', 'u.s. virgin islands', 'ayeyarwaddy division', 'chuquisaca', 'vakaga', 'gauteng', 'sirri island', 'burnham on crouch', 'jalal-abad region', 'burntisland', 'ba ria-vung tau province', 'samsun', 'bryanskaya oblast', 'republic of karachayevo-cherkessian federation', 'huelva', 'khyber paktunkhwa province', 'istanbul', 'chon buri', 'region of hama', 'zhambyl region', 'diyarbakir', 'selangor state', 'mean cheay', 'malang', 'co armagh', 'oxfordshire', 'liaoning sheng', 'sutherland', 'united kingdom', 'leningrad oblast', 'farah', 'tarlac province', 'gaza', 'samarskaya, oblast', 'champasak province', 'donetsk', 'yakutia', 'donetsk people’s republic', 'paktika eyaleti', 'perugia', 'inner mongolia', 'vologda oblast', 'tehsil bölgesi', 'kuala lumpur', 'saga', 'nordrhein-westfalen', 'makarashtra', 'yangonsichuan', 'east riding of yorkshire', 'al ahmadi governorate', 'clayton', 'southern darfur', 'primorski region', 'orlovskaya oblast', 'wilmington', 'khyber paktunkhwa', 'mugello', 'lorestan', 'grodnenskaya oblast', 'kray primorskiy', 'seoul', 'gangwon-do', 'moskovskaya zastava municipal okrug', "south p'yo'ngan province", 'hunan', 'zaporizhzhia region', 'krasnodar', 'redbridge', 'yueyang county', 'brest oblast', 'i̇dlib valiliği', 'kentucky', 'victoria', 'chuvash republic', 'mahe island', 'kasai province', 'shetland islands', 'orenburg oblast', 'kanagawa', 'estado de mexico', 'jawa tengah', 'kursk region', 'oryol oblast', 'jateng', 'minas gerais', 'east kazakhstan region', 'provincia de catamarca', 'selangor', 'northern mariana islands', 'mersin', 'western mindanao', 'denbighshire', 'cumbria', 'sussex', 'worcestershire', 'port said', 'baijiao county', 'kamchatskiy krai', 'helwan', 'kizilorda', 'fct', 'zurich', 'sacatepequez', 'county antrim', 'santa catarina', 'surry', 'herat eyaleti', 'hulhumale', 'high peak', 'kabil i̇li', 'west yorks', 'rostov-on-don oblast', 'hubei sheng', 'prov. kabul', 'provinsi nangarhar', 'pongchon', 'hertford', 'hants', 'abkhazia', 'alaska', 'tambov region', 'anhui', 'baokang county', 'giza', 'nimruz province', 'nghe an province', 'shropshire', 'yunnan', 'essex', 'liangxi district', 'south yorkshire', 'vologodskaya oblast', 'tamaulipas', 'republic of udmurtia', 'sakhalinskaya oblast', 'zabaykalskiy kray', 'sumatera utara', 'nusa kambangan island', 'new mexico', 'stafford', 'murmansk region', 'tengah', 'naypyidaw union territory', 'doğu londra', 'penang', 'republic of karachayevo', 'cross river state', 'xx', 'ar krim', 'holguín', 'miaoli county', 'punjab province', 'new brunswick', 'south kivu province', 'madrid', 'mississippi', 'west midlands', 'northwest frontier province', 'kemerovo oblast', 'dong nai province', 'rif dimashq', 'metro manila', 'south glamorgan', 'qom province', 'karachi', 'yangon', 'gansu', 'alborz province', 'maine', 'lothian', 'south sinai', 'jiangzi province', 'east london', 'shabwah', 'tehran', 'ohio', 'sagaing', 'tanintharyi region', 'ajetlate island', 'luhansk region', 'luanda', 'kaduna state', 'kursk oblast', 'kaluga oblast', 'junín', 'assam', 'dagestan', 'zhlobin gomel region', 'district of columbia', 'jinxian county', 'artvin', 'ningxia', 'solnechnogorsk region', 'north yorkshire', 'anthohomadinika atsimo', 'jalisco', 'west  midlands', 'ilfov', 'jaipur', 'maharashtra', 'northern ireland', 'fang', 'kandal', 'ningxia hui autonomous region', 'sistan and baluchistan province', 'rajasthan', 'federal capital territory', 'bioko norte', 'republic of chechnya', 'hainan', '34460', 'haryana', 'grodno oblast', 'xinjiang uyghur autonomous region (xuar)', 'san luis potosi', 'persekutuan', 'cavite', 'zelenograd', 'carmarthen', 'fata', 'kolomna region', 'sundon', 'fujian', 'permskiy krai', 'basilan province', 'hayling island', 'sukhumi district', 'nabul', 'novosibirsk region', 'west equatoria state', 'zhenjiang', 'changbai korean autonomous county', 'kelantan', 'banten', 'taiz governorate', 'new south wales', 'ajeltake islands', "north hamgyo'ng province", 'altai krai', 'county londonderry', 'lot et garonne', 'ryazan oblast', 'isle of wight', 'county clare', 'tain', 'rakhine state', 'st andrew', 'cairo', 'konya', 'samara samarskaya oblast', 'adygea republic', 'yorkshire', 'rakhine', 'north sumatra', 'strathclyde', 'minsk region', 'gallen canton', 'sakha republic (yakutia)', 'kyrgyz republic', 'illinios', 'tula region', 'sonora', 'abian', 'bali', 'altai territory', 'amur', 'western province of rwanda', 'hongkong', 'chengdu', 'xinxiang', 'zabaykalskiy krai', 'kyoto', 'provinsi hadramawt', 'badakhshan province', 'selatan', 'labuan', 'nizhniy novgorod region', 'guizhou province', 'shanghai', 'maryland', 'hebei sheng', 'zeytinburnu district', 'clwyd', 'new providence', 'new territory', 'khuzestan', 'greate r londo', 'khabarovsk krai', 'jonglei state', 'montserrado county', 'saint petersburg region', 'north west', 'north kivu province', 'minnesota', 'norwich', 'majuro ajeltake island', 'gansu province', 'iloilo province', 'ryazan region', 'north dakota', 'kaliningrad oblast', 'tx', 'krasnoyarsk krai', 'altayskiy krai', 'khatlon province', 'transnistria', 'guangning county', 'tokyo', 'arbil', 'north east', 'the autonomous republic of crimea', 'geneva', 'lagos', 'leningradskaya obl.', 'birmingham', 'co', 'df. distrito federal', 'province panama', 'région de nizhny novgorod', 'federally administered tribal areas (fata)', 'valais', 'dawley', 'arkhangelsk region', 'baluchistan i̇li', 'sofia oblast', 'berkshire', 'rahdhebai magu', 'primorskiy kray', 'hertfordshire', 'altaiskii krai', 'avenue', 'mon state', 'vaud', 'shandong', 'moskva', 'south hamgyong province', 'rostov region', 'perm territory', 'county armagh', 'aleppo', 'buzau', 'west java', 'durham', '江西省', 'western australia', 'novosibirskaya oblast', 'middx', 'batı mindanao', 'koch unity state', 'northamptonshire', 'st. gallen', 'al hudaydah governorate', 'co durham', 'udmurtia republic', 'naifaru', 'gibraltar', 'perm krai', 'bushehr province', 'primorski krai', 'arkansas', 'shangdong', 'myanmar', 'provincia de alajuela', 'haeudong', 'yaroslavl region', 'samara', 'rainham', 'sverdlovsk', 'murmasnkaya oblast', 'sverlovskaya oblast', 'jizzakh region', 'federal capital territory (fct)', 'lavan island', 'khartoum', 'yakutiya', 'republic of maris', 'west virginia', 'nangarhar province', 'udmurtskaya resp', 'severnaya osetiya-alaniya', 'kwazulu natal', 'sergiev posad district, moscow oblast', 'voronezh region', 'midlothian', 'channel islands', 'santa cruz', 'delaware', 'western cape', 'karachayevo-cherkessia', 'saanxi', 'west australia', 'orenburgskaya oblast', 'vicenza', 'feltham', 'region: gaza', 'negros oriental', 'carabobo state', 'lviv region', 'harrow', 'down', 'province sindh', 'kutahya', 'peterborough', 'wp labuan', "donetsk people's republic", 'dorset', 'republic kabardino-balkaria', 'vitosha region', 'biskra', 'tyumenskaya oblast', 'são paulo', 'florida', 'gyeonggi-do', 'uusimaa', 'san josé', 'ulyanovsk oblast', 'karatay', 'maharasthra', 'republic of dagestan', 'inner mongolia autonomous region', 'altai kray', 'mariy el republic', 'leicester', 'hadramut eyaleti', 'quezon i̇li', 'khakasia republic', 'xinjiang uygur autonomous region', 'sejong', 'south australia', 'vargas', 'chih', 'north gaza governorate', 'yelabuga region', 'izmir', 'jiangxi province', 'wirral', 'khan younis region', 'lancashire', 'province gombe', 'dadra and nagar haveli and daman and diu', 'batken oblast', 'koui ouham-pendé prefecture', 'arbat municipal okrug', 'ebonyi state', 'vitebsk region', 'helmand i̇li', 'ilam province', 'republic of tatarstan', 'hadhramout', 'surrey', 'beirut', 'tianjin', 'xinjiang uighur autonomous region', 'south kalimantan', 'nisantasi', 'northern territory', 'tyne and wear', 'kowoloon', 'chesterfield', 'herat', 'mwali', 'greater manchester', 'east susse', 'wadi khaled', 'bushehr', 'abia state', 'telangana', 'west midland', 'republic of sakha', 'mazandaran', 'carmarthenshire', 'damascus countryside', 'negeri sembilan', 'armagh', 'bay', 'kaliningrad region', 'krasnodarskiy kray', 'khouzestan', 'sistan and balochistan', 'astrakhan region', 'nueva ecija province', 'republic of bashkortostan', 'qasim', 'damascus province', 'vitebsk region/oblast', 'lanarkshire', 'anhui sheng', 'lipetsk', 'vostochno-kazakhstanskaya oblast', 'cornwall', 'nueva ecija', 'nimruz i̇li', 'kafia kingi', 'leningrad region', 'region: west bank', 'nusa tenggara barat', 'vermont', 'berlin', 'distrito capital', 'georgia', 'chihuahua', '九龍', 'nottinghamshire', 'magadan oblast', 'bamingui-bangoran', 'sulu', 'lobaye province', 'voronezh oblast', 'bago', 'federal administered tribal areas', 'darfur', 'nuevo leon', 'central island', 'quanjiao county', 'helmand', 'sistan and baluchestan', 'hong kong', 'hong kong special administrative region', 'saskatchewan', 'republic of karachayevo-cherkessia', 'parana', 'taiwan', 'van can commune', 'sheerness', 'co londonderry', 'liaoning', 'guangxi province', 'shetland', 'puducherry', 'finedon', 'ica', 'tarlac', 'mari el republic', 'tartous', 'kirkuk province', 'island east', 'marib governorate', 'wilmslow', 'hadramawt', 'f.c.t.', 'hebei', 'chungcheongnam-do', 'nishni novgarod region', 'schwyz', 'suez', 'khanty-mansi autonomous okrug yugra', 'castle bromwich', 'krasnoyarski kr', 'bizkaia', 'oldham', 'java central', 'altay krai', 'mount lebanon', 'lower juba region', 'kabardino-balkarian republic', 'shabwah governorate', 'ahuachapán', 'sosnovyy bor', 'amazonas', 'suffolk', 'xinjiang uighur autonomous regionn', 'an trai village', 'kazan oblast', 'gilan province', 'county down', 'minworth', 'tibet autonomous region', 'hormozgan', 'barming', 'saratov region', 'doma', 'thuan province', 'stanway', 'région de yangon', 'preah', 'arkhangelsk oblast', 'hubei', 'golestan', 'utah', 'kabylie region', 'vitebskaya oblast', 'moscow region', 'washington', 'jilin province', 'johor', 'sao paulo', 'nimroz', 'dyfed', 'gujarat', 'brussels', 'dunbartonshire', 'kabul', 'semyonovskii admiralteiskii region', 'timur', 'republic of karelia', 'rudgwick', 'cleveland', 'minsk region/oblast', 'sakhalinsk oblast', 'antrim county', 'derby', 'heilongjiang province', 'voromezh oblast', 'barnacle', 'hong kong island', 'kostroma oblast', 'kabul province', 'hovedstaden', 'karaçay çerkes cumhuriyeti', 'kaliningradskaya oblast', 'anbar bölgesi', '11185', 'isfahan county', 'north waziristan', 'cheshire', 'caithness', 'gyeongsangnam-do', 'quebec', 'sentosa', 'saint petersburg', 'cayo coco', 'damascus-countryside', 'chafford hundred', 'flintshire', 'laguna', 'jiangsu', 'pakhtunkhwa province', 'sulu region', 'luhansk oblast', 'northwestern', 'moscow oblast', 'shehong county', 'amurskaya oblast', 'nizhni novgorod oblast', 'ivanovo oblast', 'deir ez-zor governorate', 'monza and brianza', 'washington state', 'manitoba', 'tinh province', 'shanliurfa', 'clackmannanshire', 'tatarstan resp', 'hebei province', 'zhukovsky region', 'yaroslavsk oblast', 'brest reg', 'gulin county', 'rasaught', 'mitcham', 'crimea', 'jilin', 'tatarstan republic', 'lipetsk oblast', 'norton', 'stavropol krai', 'ross-shire', 'krasnodarski krai', 'yamalo-nenets autonomous okrug', 'tenerife', 'tower hamlets', 'karaganda oblast', 'south humberside', 'buryatia', 'ayeyarwaddy', 'sichuan sheng', 'metro manilla', 'tortola', 'republic of crimea', 'kabiliye bölgesi', 'kabardino-balkar republic', 'kherson oblast', 'yugan county', 'harju county', 'kandahar province', 'balochistan province', 'tula oblast', 'vakaga prefecture', '1111020', 'khanh hoa', 'north osetia-alania republic', 'new addington', 'anbar province', 'tambov oblast', 'alexandria', 'tennessee', 'odisha', 'northwest federal region', 'andhra pradesh', 'central kabul', 'ongar', 'i̇stanbul', 'khanty-mansisyk autonomous okrug-yugra', 'county durham', 'novgorodskaya oblast', 'aden', 'republic of mordovia', 'beijing', 'gwent', 'bergamo', 'shunyi district', 'west bengal', 'gloucester', 'kamchatka krai', '34467', 'henan province', 'gaza strip', 'huntington', 'northern gaza', "al-bayda' governorate", 'matanzas', 'hampshire', 'glasgow', 'quillacollo', 'oblast novosibirskaya', 'gloucestershire', 'mumbai', 'staffordshire', 'syrdarya region', 'trung', 'samara oblast', 'zaporizhia region', 'miami', 'kingstown', 'jakarta', 'ndjamena', 'turkmen jebel region', 'kildare', 'unity state', 'hutton', 'yaroslavl oblast', 'virginia', 'catamarca', 'south austrailia', 'primorskiy krai', 'maluku', 'haslemere', 'zulia', 'north osetia-alania', 'moheli', 'primorskiy region', 'san francisco', 'sumatera barat', 'tver', 'south holland', 'jiangsu sheng', 'diyali', 'oxford', 'kabylie', 'homs', 'kent', 'vladimir region', 'sicuan', 'sumut', 'al-mahrah governorate', 'hillmorton', 'khimki region', 'wilayah persekutuan kuala lumpur', 'cochabamba', 'south east london', 'menouba governorate', 'liujiang county', 'ncd', 'junin', 'lagos state', 'herts', 'new hampshire', 'north carolina', 'kerala', 'karachay-cherkess republic', 'shaanxi province', 'quezon', 'dagestan rep.', 'rhondda cynon taf', 'esfahan', 'pskov oblast', 'conwy county borough', 'kayah', 'hawali governorate', 'qidong, jiangsu province', 'lantian county', 'xuyi county', 'hamgyong province', 'novgorod region', 'nizhny novgorod', 'udmurtskaya', 'central', 'chukotka autonomous oblast', 'california', 'hama governorate', 'kayin state', 'shandong province', 'al anbar province', 'rostov oblast', 'the central', 'karachayevo-cherkessia republic', 'handforth', 'dudley', 'grodno region', 'kocaeli', 'wales', 'xiangyin country', 'guangzhou city guangdong province', 'trujillo', 'republic of sakha (yakutia)', 'smolensk oblast', 'newham', 'thimarafushi', 'fars province', 'zaporizhzhia oblast', "chandler's ford", 'villimale', 'shanxi', 'st martin', 'fl', 'east azerbaijan', 'qinghe', 'kurdistan', 'new delhi', 'guangxi zhuangzuzizhiqu', 'ontario', 'anbar', 'federal territory of labuan', 'guerrero', 'haut-uolo', 'nicosia', 'provincia: luanda', 'cundinamarca', 'nimroz province', 'krasnodar krai', 'nana-grebizi', 'hertfordshire,', 'helmand province', 'west jakarta', 'samut prakan', 'federally administered tribal area', 'yashnobod region', 'solnechnogorskiy region', 'shaanxi', 'dong nai', 'mordovia republic', 'canouan island', 'qidong', 'province of havana', 'khyber pakhtunkhwa', 'nimruz', 'south hwanghae province', 'zhaosu county', 'beni territory', 'ny', 'bueng kum', 'mallorca', 'sindh province', 'archangelskaya oblast', 'canberra act', 'qandahar province', 'central java', 'bryansk region', 'anbar region', 'syrian arab republic', 'khojir region', 'ninh thuan province', 'woodham', 'al maryah island', '1202', 'central administrative okrug', 'namangan', 'kirovskaya', 'rotherham', 'republic of udmurtskaya', 'khanty-mansi autonomous okrug - yugra', 'indiana', 'chelyabinsk region', 'british virgin islands', 'kabardino-balkaria republic', 'sverdlovsk region', 'volgogradskaya oblast', 'bas-uolo', 'louisiana', 'utrecht', 'caba', 'sichuan province', 'angus', 'chuvash republic-chuvashia', 'nizhny novgorod oblast', 'london', 'missouri', 'ombella-mpoko province', 'provincia y departamento de lima', 'north kivu', 'smolensk region', 'uygur autonomous region', 'karelia republic', 'solihull', 'antalya', 'azad jammu and kashmir', 'surbiton', 'alsace', 'queensland', 'ireland', 'cross river', 'ramsey', 'tenggara', 'guangdong', 'karen state', 'anjouan', 'tokyo-to', 'kharg island', 'brestskaya', 'zaporizhskiy region', 'south ossetia', 'mandalay region', 'alberta', 'heilongjiang', 'denton', 'tibet', 'zabaikalsk krai', 'battersea', 'chungcheongbuk-do', 'guangdonng', 'idaho', "lugansk people's republic", 'moskovskaya obl.', 'chonburi province', 'castor', 'gwynedd', 'krasnodar region', 'north of lebanon', 'west lothian', 'turkish republic of northern cyprus', 'west java province', '34956', 'demerara', 'kangwon province', 'sverdlovskaya obl.', 'longgang', 'korolev oblast', 'east sussex', 'quintana roo', 'yangon region', 'pursat province', 'southsea', 'stanmore', 'sverdlovskaya oblast', 'buslingthorpe', 'provinsi dki jakarta', 'chita region', 'new territories', 'yaroslav oblast', 'perth', 'belgorod oblast', 'mengjin county', 'maranhao', 'omsk region', 'delhi', 'villa clara', 'texas', 'north darfur', 'provinsi bali', 'county of st. george east', 'hadramout province', 'nizhniy novgorod oblast', 'nangarhar', 'chechnya', 'massachusetts', 'misnk region', 'provinsi jawa tengah', 'kiashahr gilan province', 'jersey', 'guangxi', 'alpujarras', 'novgorod oblast', 'baja', 'australian capital territory', 'kemerovo region', 'qinghai province', 'republica de panama', 'kunar', 'crowle', 'paramaribo', 'md', 'nizhegorodskaya', 'sichuan', 'salai county', 'gaziantep', 'chuy region', 'mogilev oblast', 'bolton', "p'yo'ngan province", 'warwickshire', 'port-au-prince', 'tartus', 'naypyidaw', 'hong kong sar', 'zabaykalsky krai', 'west glamorgan', 'archangelsk region', 'kherson region', 'somerset', 'chaguanas', 'hawaii', 'buryatiya', 'pyongyang', 'd.1 nizhny novgorod region', 'new waltham', 'south kivu', 'saratovskaya oblast', 'attica', 'republic of vanuatu', 'zabul', 'wilayah persekutuan labuan', 'new york', 'kansas', 'tamps', 'renfrewshire', 'maranhão', 'feixi county', 'kirov region', 'rutshuru territory', "al bayda' governorate", 'saada governorate', 'donetsk oblast', 'gomelskaya oblast', 'coahuila', 'torfaen', 'aberdeenshire', 'i̇zmir', 'olancho', 'karelia', 'voronezhskaya oblast', 'republic of north ossetia-alania', 'amran', 'bago region', 'north rhine-westphalia', 'ulam dong', 'khanty-mansiysky avtonomnyi', 'grand cayman', 'mandalay province', 'michigan', 'xingshan county', 'am dafock', 'gaoqing county', 'vale of glamorgan', 'nizhny novgorod region', 'weston-super-mare', 'co. donegal', 'harworth', 'nova scotia', 'tehsil rinala khurd', 'sakha republic', 'ankara', 'kirovskaya obl.', 'tver region', 'stirlingshire', 'kalmykia republic', 'novgorod', 'roundhay', 'ingushetia', 'serdika region', 'bukharskaya oblast', 'novosibirsk oblast', 'kandahar', 'penzenskaya oblast', 'bashkortostan republic', 'shangrao jiangxi province', 'lima', 'stirling', 'shenzhen', 'ayrshire', 'sulu bölgesi', 'fergana region', 'county fermanagh', 'volga federal region', 'scottish borders', 'new malden', 'kirov oblast', 'nebraska', 'south wales', 'guandong', 'hadramawt governorate', 'kowloon', 'manchester', 'primorsky kray', 'sverdlovskaya obl', 'shan state', 'kermanshah', 'baluchistan province', 'yamalo-nenets autonomous area', 'stockport', 'chukotka', 'enugu', 'ajeltake', 'vladimir oblast', 'khanty-mansi autonomous region', 'moscow', 'chechen republic', 'gaza governorate', 'kangan', 'rangoon', 'amsterdam', 'republic of udmurt', 'chukotka autonomous okrug', 'iowa', 'ouest', 'republic of mari el', 'keserwan-jbeil', 'damascus', 'madhya pradesh', 'amur oblast', 'sumatera utar', 'firouzkouh county', 'pakistan border region', 'baluchistan', 'irkutsk', 'salalah dhofar governorate', 'jalisc', 'glamorgan', 'arab republic', 'nanjing county', 'middlesex', 'lanao del sur', 'northwich', 'harju maakond', 'al-anbar', 'west azerbaijan', 'hhohho', 'bryansk oblast', 'ayeyarwady', 'osmaniye', 'republic of chuvashia', 'wyoming', 'mahe', 'bedfordhsire', 'al-anbar province', 'primorsky krai', 'hama region', 'parana state', 'sind', 'north humberside', 'hoa binh', 'kedah', 'devon', 'ivanov oblast', 'almhahra', 'guangzhou', 'sandy', 'samara region', 'bristish columbia', 'south dakota', 'british-colombia', 'antigua', 'new jersey', 'sweida', 'baleares', 'guizhou', 'pennsylvania', 'suqatra', 'gazze şeridi', 'hama', 'donetsk peoples republic', 'avon', 'wicklow', 'takal region', 'lincoln', 'aichi-ken', 'il', 'mount lebanon governorate', 'admiralteiskii region', 'sucre', 'south governorate', 'ismailia', 'binlang county', 'kampala', 'ecija province', 'cayos de villa clara', 'federally administered tribal areas', 'kalmykia', 'shanxi province', 'laian county', 'west sussex', 'billingham', 'al anbar', 'kwazulu-natal', 'ut', 'pahang', 'xinjiang', 'lancs', 'leningradskaya oblast', 'hong kong (sar)', 'sagaing region', 'anhua', 'tehran province', 'moskovskaya', 'north ossetia-alania republic', 'gyengsangbuk-do', 'provinsi jawa timur', 'wiltshire', 'tatarstan', 'londonderry county', 'coleraine county', 'preah sihanouk', 'lidingö', 'sosnovski region', 'kurgan region', 'mid glamorgan', 'quezon province', 'zhejiang sheng', 'castel', 'santiago', 'irkutsk region', 'yanling county', 'islamabad', 'north hwanghae province', 'middlesbrough', 'vernon', 'ha tinh province', 'navoiy region', 'paktika province', 'dahyan governorate', 'isle of man', 'santa ana', 'tyumen region', 'gholestan', 'leeds', 'east java', 'jammu and kashmir', 'goa', 'magway', 'american samoa', 'sulawesi tengah', 'greater london', 'udmurtia', 'gomelskaya', 'udmert republic', 'mangistauskaya oblast', 'island of mohéli', 'gomel region', 'vitebsk oblast', 'muscat governorate', 'st. nicholas at wade', 'pristina', 'lida oblast', 'lahore', 'khaborovsk krai', 'bromley', 'baidoa bay region', 'kolpino', 'kohgiluyeh and boyer-ahmad', 'balochistan', 'ha nam province', 'raa atoll', 'northumberland', 'katanga', 'kalyazinski region', 'komi republic', 'brest region', 'kohkiluye-va-boyer', 'derbyshire', 'badong county', 'in', 'lincolnshire', 'kalhaidhoo', 'tomsk oblast', 'sutton coldfield', 'guatemala', 'chelyabinsk oblast', 'wilayah persekutuan', 'fryazino region', 'penza oblast', 'tomilino', 'sverdlovsk oblast', 'gao region', 'krasnodar territory', 'bangui', 'almaty region', 'thornton heath', 'uttar pradesh', 'guangdong sheng', 'ks', 'kostanayskaya oblast', 'minsk oblast', 'huailai county', 'milan', 'zhejian', 'norfolk', 'hemlington', 'lusaka province', 'county cavan', 'gia lai province', 'krasnoyarsk region', 'bashkortostan', 'mandalay', 'kohgaloye and boyer ahmad province', 'henan', 'kemerovo oblast-kuzbass', 'anhui province', 'arizona', 'teesside', 'primorsky region', 'radstock', 'sindh', 'yorskhire', 'zabaikalski kr.', 'mahé', 'oxon', 'leyte', "ta'izz governorate", 'weihei', 'isle of skye', 'samarskaya oblast', 'gombe', 'alabama', 'herefordshire', 'kaluga region', 'sampsonievskoe', 'buckingham', 'irkutsk oblast', 'neamț county', 'astrakhan oblast', 'autonomous republic of crimea', 'sakarya province', 'isfahan', 'suchitepequez', 'sakhalin oblast', 'kurgan oblast', 'ramenskoye region', 'moskovskaya oblast', 'guangxi zhuang autonomous region', 'departamento de san salvador', 'udmurt republic', 'oklahoma', 'sharqia', 'nevada', 'ajeltake island', 'perthshire', 'lampung', 'chuvashia', 'jiayu county', 'jawa timur', 'autonomes island of anjouan', 'fars', 'hunan province', 'pangasinan province', 'baghdad', 'mahrashtra', 'buckinghamshire', 'british columbia', 'menaka gao region', 'idlib province', 'fujian province', 'zuid-holland', 'kayin', 'crimea republic', 'kordestan', 'ha nam', 'jiangsu province', 'skane lan', 'delta state', 'isfahan province', 'connecticut', 'himachal pradesh', 'antrim', 'state of santa catarina', 'murmansk', 'tamil nadu', 'volgograd oblast', 'kensington & chelsea', 'tyne & wear', 'limete', 'northern darfur', 'tyrone', 'baja california sur', 'tyumen oblast', 'odintsovo district', 'quartier socimat', 'kabardino-balkaria', 'west bank', 'kuala lumpur wilayah persekutuan', 'st. george', 'sidi bel abbes', 'jewish autonomous oblast', 'nam định', 'barmal paktika province', 'khuzestan province', 'liaoning province', 'naypyitaw', 'thurgau', 'semnan province', 'cremona', 'deir ez-zor valiliği', 'nan an', 'perm region', 'vasilevskiy island', 'rostovskaya oblast', 'north hamgyong province', 'ancash', 'perak', 'abyan governorate', 'leigh-on-sea', 'murmansk oblast', 'severo-kazakhstanskaya oblast', 'co down', 'manila', 'qinghai', 'manchester greater', 'pichincha', 'state of selangor', 'north chungcheong', 'nangarhar eyaleti', 'idlib governorate', 'bedfordshire', 'kunar province', 'east yorkshire', 'yuzhno-sakhalinsk oblast', 'mandalay division', 'hadramawt province', 'hwanghae province', 'ben arous', 'zhejiang', 'gyunggi', 'baghdad governorate', 'rhode island', 'sergipe', 'sinaloa', 'sakarya', 'warrington', 'omsk oblast', 'gomel oblast', 'veracruz', 'oregon', 'south carolina', 'tekirdag', 'palestinian territories', 'lattakia governorate', 'veziristan', 'wisconsin', 'rizal', 'almaty oblast', 'nayarit', 'thanh hoa province', 'salaj', 'northern khorasan province', 'hubei province', 'moskovskaya obl', 'xixiang', 'republic of buryatia', 'zhejiang province', 'vienna', 'feydhoo', 'karaj alborz province', 'northants', 'chongren county', 'punjab', 'michoacan', 'castilla-la mancha', 'alborz', 'vasilyevski island', 'south lanarkshire', 'andhra pardesh', 'mari el', 'central america', 'greenford', 'province guangdong', 'durango', 'stavropolskiy krai', 'enugu state', 'banten province', 'bay region', 'huanjiang county', 'davao', 'kingswood', 'paktia province', 'nethern antilles', 'federally administered tribal areas(fata)', 'cambridgeshire', 'pulau pinang', 'montana', 'winnersh', 'shantou guangdong province', 'incheon', 'chattisgarh', 'hainan province', 'shahin shahr', 'tula', 'jawa barat', 'nanshan zhiyuan', 'illinois', 'republic of bashkiria'}
 
+CITY_TO_COUNTRY = {'beirut': 'Lebanon', 'krasnodar': 'Russia', 'xiangtan city': 'China', 'nanjing': 'China', 'yangon': 'Myanmar', 'tehran': 'Iran', 'manchester': 'UNITED KINGDOM', 'london': 'UNITED KINGDOM', 'beijing': 'China', 'luhansk': 'Ukraine', 'lublin': 'Poland', 'são luís': 'Brazil', 'hangzhou': 'China', 'novosibirsk': 'Russia', 'front royal': 'United States', 'roanoke': 'United States', 'saint petersburg': 'Russia', 'moscow': 'Russia', 'christiansburg': 'United States', 'baghdad': 'Iraq', 'oxnard': 'United States', 'miami': 'United States', 'rostov-on-don': 'Russia', 'hangzhou city': 'China', 'urumqi': 'China', 'bushey': 'UNITED KINGDOM', 'guangzhou': 'China', 'dalian': 'China', 'mikhaylovsk': 'Russia', 'guangzhou city': 'China', 'laktasi': 'Bosnia and Herzegovina', 'donetsk': 'Ukraine', 'shanghai': 'China', 'pyongyang': 'NORTH KOREA', 'ruther glen': 'United States', 'gudermes': 'RUSSIAN FEDERATION', 'hazelwood': 'United States', 'wuxi': 'China', 'birmingham': 'UNITED KINGDOM', 'harlow': 'UNITED KINGDOM', 'wigston': 'United Kingdom', 'brighton': 'UNITED KINGDOM', 'kunming': 'China', 'huddersfield': 'UNITED KINGDOM', 'bradford': 'UNITED KINGDOM', 'butembo': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'huizhou': 'China', 'leigh': 'UNITED KINGDOM', 'samara': 'Russia', 'istanbul': 'Turkey', 'quanzhou': 'China', 'liverpool': 'UNITED KINGDOM', 'wakefield': 'UNITED KINGDOM', 'chengdu': 'China', 'dalian city': 'China', 'shenyang': 'China', 'wuxi city': 'China', 'berezniki': 'Russia', 'yantai city': 'China', 'shrewsbury': 'UNITED KINGDOM', 'minsk': 'Belarus', 'miranda': 'Venezuela', 'irvine': 'United States', 'chennai': 'India', 'milan': 'Italy', 'shiyan city': 'China', 'barnsley': 'UNITED KINGDOM', 'sleaford': 'UNITED KINGDOM', 'dewitt': 'United States', 'port vila': 'Vanuatu', 'nicosia': 'Cyprus', 'suzhou city': 'China', 'midlothian': 'United States', 'houston': 'United States', 'wilmington': 'United States', 'market drayton': 'UNITED KINGDOM', 'simferopol': 'Ukraine', 'majuro': 'Marshall Islands', 'hengshui city': 'China', 'shenzhen': 'China', 'meikhtila': 'Myanmar [Burma]', 'limassol': 'Cyprus', "xi'an": 'China', 'slough': 'UNITED KINGDOM', 'richmond': 'United States', 'tacheng city': 'China', 'dhaka': 'Bangladesh', 'siasi': 'Philippines', 'toronto': 'Canada', 'gaza': 'Palestine', 'anderson': 'United States', 'greensboro': 'United States', 'irkutsk': 'Russia', 'arlington': 'United States', 'zunyi': 'China', 'greenville': 'United States', 'cairo': 'Egypt', 'haikou city': 'China', 'ulanbataar': 'Mongolia', 'north hamptonshire': 'United Kingdom', 'shijiazhuang city': 'China', 'taiyuan': 'China', 'ebene': 'MAURITIUS', 'arzamas': 'Russia', 'zürich': 'SWITZERLAND', 'hyderabad': 'India', 'sevastopol': 'Ukraine', 'chester': 'UNITED KINGDOM', 'ekaterinburg': 'Russia', 'masaya': 'NICARAGUA', 'trekhgorny': 'Russia', 'zhuzhou': 'China', 'kingstown': 'SAINT VINCENT AND THE GRENADINES', 'dubai': 'United Arab Emirates', 'luoyang': 'China', 'derby': 'UNITED KINGDOM', 'camberley': 'UNITED KINGDOM', "tai'an city": 'China', 'pristina': 'Kosovo', 'genève': 'SWITZERLAND', 'bracknell': 'UNITED KINGDOM', 'rangoon': 'MYANMAR', 'kurgan': 'Russia', 'lanzhou': 'China', 'qidong': 'China', 'luanda': 'ANGOLA', 'khimki': 'Russia', 'johar bahru': 'Malaysia', 'city qazvin': 'Iran', 'yangzhou shi': 'China', 'dunstable': 'UNITED KINGDOM', 'kranodar': 'Russia', 'serpukhov': 'Russia', 'zurich': 'Switzerland', 'leicester': 'UNITED KINGDOM', 'macclesfield': 'UNITED KINGDOM', 'ufa': 'Russia', 'norfolk': 'United States', 'mandalay': 'Myanmar [Burma]', 'qingdao': 'China', 'auckland': 'New Zealand', 'cerritos': 'UNITED STATES', 'sunbury-on-thames': 'UNITED KINGDOM', 'tumushuke': 'China', 'tver': 'Russia', 'education town': 'Pakistan', 'chatham': 'UNITED KINGDOM', 'blagoveshchensk': 'Russia', 'ben arous': 'Tunisia', 'ballycastle': 'UNITED KINGDOM', 'middlesex': 'UNITED KINGDOM', 'germantown': 'United States', "xi'an city": 'China', 'anahawan': 'PHILIPPINES', 'krasnoyarsk': 'Russia', 'bangkok': 'Thailand', 'nanchang': 'China', 'ganzhou city': 'China', 'petersburg': 'United States', 'kocaeli': 'Turkey', 'harrow': 'UNITED KINGDOM', 'chuzhou': 'China', 'carson': 'United States', 'chongqing': 'China', 'kowloon': 'Hong Kong', 'bozhou city': 'China', 'st. petersburg': 'Russia', 'hlaing': 'Myanmar', 'jinan': 'China', 'kaspiysk': 'Russia', 'yinchuan': 'China', 'indianapolis': 'United States', 'ajman': 'United Arab Emirates', 'hammond': 'United States', 'glasgow': 'UNITED KINGDOM', 'sharjah': 'United Arab Emirates', 'paris': 'France', 'kuala lumpur': 'Malaysia', 'lahore': 'Pakistan', 'krasnoznamensk': 'Russia', 'puducherry': 'India', 'ilford': 'UNITED KINGDOM', 'surrey': 'UNITED KINGDOM', 'damascus': 'Syria', 'annapolis': 'United States', 'tachileik': 'MYANMAR', 'canton': 'United States', 'murmansk': 'Russia', 'khorramshahr': 'Iran', 'rajshahi city': 'Bangladesh', 'foshan': 'China', 'kunduz': 'Afghanistan', 'wuhan': 'China', 'zhongdian': 'China', 'hotan area': 'China', 'tegucigalpa city': 'Honduras', 'quetta': 'Pakistan', 'geneva': 'Switzerland', 'killeen': 'United States', 'huancayo': 'Peru', 'exton': 'United States of America', 'sarajevo': 'Bosnia and Herzegovina', 'vologda': 'Russia', 'changsha': 'China', 'bursa': 'Turkey', 'blackburn': 'UNITED KINGDOM', 'wuhan city': 'China', 'centreville': 'United States', 'brixham': 'United Kingdom', 'chelyabinsk': 'Russia', 'shijiazhuang': 'China', 'mombasa': 'Kenya', 'bristol': 'UNITED KINGDOM', 'granger': 'United States', 'fuzhou city': 'China', 'alexandria': 'United States', 'konya': 'Turkey', 'mooresville': 'United States', 'shihezi': 'China', 'antalya': 'Turkey', 'san lorenzo': 'El Salvador', 'vorkuta': 'Russia', 'yangjiang': 'China', 'omsk': 'Russia', 'san jose': 'United States', 'cambridge': 'UNITED KINGDOM', 'huludao city': 'China', 'springfield': 'United States', 'torpoint': 'UNITED KINGDOM', 'kirov': 'Russia', 'changchun': 'China', 'appomattox': 'United States', 'manassas': 'United States', 'baling': 'MALAYSIA', 'roanoke rapids': 'United States', 'nanchong': 'China', 'doncaster': 'UNITED KINGDOM', 'al moukalla': 'YEMEN', 'liaoyang city': 'China', 'bandar abbas': 'Iran', 'gaoan city': 'CHINA', 'arsal': 'Lebanon', 'khabarovsk': 'Russia', 'inkster': 'United States', 'peshawar': 'Pakistan', 'baton rouge': 'United States', 'naypyitaw': 'Myanmar', 'yekaterinburg city': 'Russian Federation', 'grand-lancy': 'SWITZERLAND', 'chengdu city': 'China', 'hefei': 'China', 'grozny': 'Russia', 'des plaines': 'United States', 'guarulhos': 'Brazil', 'new york': 'United States', 'watford': 'United Kingdom', 'cremona': 'Italy', 'stoskholm': 'SWEDEN', 'walsall': 'UNITED KINGDOM', 'helston': 'UNITED KINGDOM', 'kursk': 'Russia', 'antwerpen': 'Belgium', 'tangshan city': 'China', 'bromley': 'UNITED KINGDOM', 'st. paul': 'United States', 'weslaco': 'United States', 'southbank': 'AUSTRALIA', 'dartford': 'UNITED KINGDOM', 'new haven': 'United States', 'genf': 'SWITZERLAND', 'glossop': 'United Kingdom', 'rotherham': 'UNITED KINGDOM', 'ilkeston': 'UNITED KINGDOM', 'tenterden': 'UNITED KINGDOM', 'leeds': 'UNITED KINGDOM', 'albuquerque': 'United States', 'xiamen': 'China', 'cannes': 'France', 'zelenograd': 'Russia', 'ipswich': 'UNITED KINGDOM', 'new delhi': 'India', 'staines-upon-thames': 'United Kingdom', 'alicante': 'SPAIN', 'batley': 'UNITED KINGDOM', 'hengyang': 'China', 'mumbai city': 'India', 'laibin': 'China', 'port-au-prince': 'Haiti', 'vladivostok': 'Russia', 'phnom penh': 'Cambodia', 'qom': 'Iran', 'anda': 'Philippines', 'ningbo city': 'China', 'astrakhan': 'Russia', 'hefei city': 'China', 'langen': 'Germany', 'qinhuangdao': 'China', 'bolton': 'UNITED KINGDOM', 'dereham': 'UNITED KINGDOM', 'lahore city': 'Pakistan', 'st. ives': 'UNITED KINGDOM', 'isfahan': 'Iran', 'korolyov': 'Russia', 'hartford': 'United States', 'tula': 'Russia', 'bury st edmunds': 'UNITED KINGDOM', 'frederick': 'United States', 'salford': 'UNITED KINGDOM', 'ware': 'UNITED KINGDOM', 'caracas': 'Venezuela', 'sanaa': 'Yemen', 'al sad el aaly dokhi': 'Egypt', 'mount pleasant': 'United States', 'weihai': 'China', 'nizhny novgorod': 'Russia', 'portland': 'United States', 'sterling': 'United States', 'mashad': 'Iran', 'panzhihua city': 'China', 'moroni': 'COMOROS', 'newport news': 'United States', 'harlingen': 'United States', 'kabul': 'Afghanistan', 'xian': 'China', 'darlington': 'UNITED KINGDOM', 'singapore': 'Singapore', 'sydney': 'Australia', 'baoding city': 'China', 'melbourne': 'Australia', 'feltham': 'UNITED KINGDOM', 'kolpino': 'RUSSIAN FEDERATION', 'tianjin city': 'China', 'solikamsk': 'Russia', 'oran': 'ALGERIA', 'balashikha': 'Russia', 'maidens': 'United States', 'd.i. khan': 'PAKISTAN', 'yili kazakh autonomous prefecture': 'China', 'loja': 'ECUADOR', 'lausanne': 'SWITZERLAND', 'weifang city': 'China', 'alar': 'China', 'male': 'Maldives', 'vitebsk': 'Belarus', 'fuzhou': 'China', 'elektrostal': 'Russia', 'beckenham': 'UNITED KINGDOM', 'asaba': 'Nigeria', 'dakar': 'Senegal', 'el paso': 'United States', 'plymouth': 'UNITED KINGDOM', 'monterrey': 'Mexico', 'guilin city': 'China', 'gusev': 'Russia', 'bognor regis': 'UNITED KINGDOM', 'chongqing city': 'China', 'surgut': 'Russia', 'az zabadan': 'SYRIA', 'golitsyno': 'Russia', 'malabo': 'Equatorial Guinea', 'mytishchi': 'Russia', 'chelmsford': 'UNITED KINGDOM', 'kovrov': 'RUSSIAN FEDERATION', 'hopewell': 'United States', 'tall ‘afar': 'Iraq', 'indo hills': 'Canada', 'riga': 'Latvia', 'tiemenguan': 'China', 'murom': 'Russia', 'tonghua city': 'China', 'denpasa': 'INDONESIA', 'dushanbe': 'Tajikistan', 'rixeyville': 'United States', 'whittier': 'United States', 'baku': 'Azerbaijan', 'bushehr': 'Iran', 'great yarmouth': 'UNITED KINGDOM', 'yangzhou': 'China', 'montreal': 'Canada', 'stratford upon avon': 'UNITED KINGDOM', 'abuja': 'Nigeria', 'mclean': 'United States', 'fredericksburg': 'United States', 'nay pyi taw': 'Myanmar', 'xingping': 'China', 'msida': 'Malta', 'wuyishan': 'China', 'tema': 'Ghana', 'yuba city': 'United States', 'suffolk': 'United States', 'colne': 'United Kingdom', 'zouping': 'China', 'newquay': 'United Kingdom', 'greenwood': 'United States', 'armagh': 'UNITED KINGDOM', 'taizhou city': 'China', 'nanchang city': 'China', 'billericay': 'UNITED KINGDOM', 'pineville': 'United States', 'mitrovica': 'Kosovo', 'balzan': 'Malta', 'tripoli': 'Libya', 'jinhua': 'China', 'kinhasa': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'yeovil': 'UNITED KINGDOM', 'voronezh': 'Russia', 'west hartford': 'United States', 'tonghua': 'China', 'sevenoaks': 'UNITED KINGDOM', 'kiribathgoda': 'SRI LANKA', 'bishkek': 'Kyrgyzstan', 'changsha city': 'China', 'galashiels': 'UNITED KINGDOM', 'washington dc': 'United States', 'zug': 'SWITZERLAND', 'jakarta timur': 'Indonesia', 'nabek': 'Syria', 'verkhnyaya pyshma': 'Russia', 'suzhou': 'China', 'tarusa': 'RUSSIAN FEDERATION', 'petropavlovsk-kamchatskiy': 'Russia', 'yakutsk': 'Russia', 'shchelkovo': 'Russia', 'raduzhny': 'Russia', 'salem': 'United States', 'kunshan': 'China', 'harbin city': 'China', 'shandong': 'China', 'saffron walden': 'United Kingdom', 'belford': 'UNITED KINGDOM', 'toledo': 'United States', 'west haven': 'United States', 'xining': 'China', 'basildon': 'United Kingdom', 'beachwood': 'United States of America', 'shymkent': 'Kazakhstan', 'maanshan city': 'China', 'hanoi': 'Vietnam', 'doral': 'United States', 'ryazan': 'Russia', 'mianyang city': 'China', 'naro-fominsk': 'Russia', 'poole': 'UNITED KINGDOM', 'chişinău': 'MOLDOVA', 'cudahy': 'United States', 'aksu prefecture': 'China', 'rose bud': 'United States', 'belturbet': 'UNITED KINGDOM', 'sugar land': 'United States', 'kinshasa': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'mcallen': 'United States', 'holmwood': 'UNITED KINGDOM', 'ho chi minh city': 'Vietnam', 'ulaanbaatar': 'Mongolia', 'jeffersonville': 'United States', 'dongying': 'China', 'argun': 'Russia', 'dallas': 'United States', 'larnaca': 'Cyprus', 'abidjan': "CÔTE D'IVOIRE", 'chongjin': 'North Korea', 'enfield': 'UNITED KINGDOM', 'berea': 'South Africa', 'reading': 'UNITED KINGDOM', 'ho chi minh': 'Vietnam', 'columbia': 'United States', 'korolev': 'Russia', 'yalta': 'Ukraine', 'makati city': 'Philippines', 'danyang city': 'China', 'jilin': 'China', 'stamford': 'United States', 'kabylie region': 'ALGERIA', 'tokyo': 'Japan', 'mosul': 'Iraq', 'lytham st. annes': 'United Kingdom', 'brighouse': 'United Kingdom', 'las vegas': 'United States', 'phar an township': 'MYANMAR', 'denver': 'United States', 'shipston-on-stour': 'UNITED KINGDOM', 'rugby': 'UNITED KINGDOM', 'oldbury': 'UNITED KINGDOM', 'tianjin': 'China', 'qingdao city': 'China', 'monrovia': 'Liberia', 'chía': 'Colombia', 'dadaab': 'Kenya', 'port glasgow': 'United Kingdom', 'basilan': 'Philippines', 'pyeongtaek': 'South Korea', 'nairobi': 'Kenya', 'north waziristan': 'Pakistan', 'pretoria': 'SOUTH AFRICA', 'hengshui': 'China', 'corby': 'UNITED KINGDOM', 'ottawa': 'Canada', 'nelson': 'UNITED KINGDOM', 'newark': 'UNITED KINGDOM', 'mcgaheysville': 'United States', 'tyumen': 'Russia', 'kangdong': 'NORTH KOREA', 'edinburgh': 'UNITED KINGDOM', 'baoji city': 'China', 'taichung': 'Taiwan', 'balderton': 'UNITED KINGDOM', 'chisinau town': 'Moldova', 'tumushuke city': 'China', 'itasca': 'United States', 'hemel hempstead': 'UNITED KINGDOM', 'wokingham': 'UNITED KINGDOM', 'mlawa': 'POLAND', 'alpharetta': 'United States', 'karachi': 'Pakistan', 'reutov': 'Russia', 'oslo': 'Norway', 'guiyang': 'China', 'rainham': 'UNITED KINGDOM', 'bourbon': 'United States', 'vienna': 'Austria', 'coldwater': 'United States', 'novokuznetsk': 'Russia', 'fresno': 'United states', 'bronnitsy': 'Russia', 'brentwood': 'UNITED KINGDOM', 'enugu': 'Nigeria', 'berkeley': 'United States', 'langfang city': 'China', 'chesapeake': 'United States', 'kara-balta city': 'KYRGYZSTAN', 'yicheng city': 'CHINA', 'shenzhen city': 'China', 'hammam - sousse': 'TUNISIA', 'baltimore': 'United States', 'jackson': 'United States', 'wallace': 'United States', 'qingyang': 'China', 'sydney cbd': 'Australia', 'burnley': 'United Kingdom', 'mirny': 'Russia', 'hammam lif': 'Tunisia', "gao'an city": 'CHINA', 'myitkyina': 'Myanmar', 'wujiaqu city': 'China', 'kabil': 'AFGHANISTAN', 'nokesville': 'United States', 'bend': 'United States', 'myrtle beach': 'United States', 'ashford': 'UNITED KINGDOM', 'dongguan': 'China', 'playas de rosarito': 'Mexico', 'kampala': 'Uganda', 'cleveland': 'United States', 'boynton beach': 'United States', 'aberdeen': 'UNITED KINGDOM', 'cary': 'United States', 'sheffield': 'UNITED KINGDOM', 'peacehaven': 'UNITED KINGDOM', 'fergana city': 'Uzbekistan', 'prescot': 'United Kingdom', 'mianyang': 'China', 'walton-on-thames': 'United Kingdom', 'westminster': 'United States', 'bishop auckland': 'UNITED KINGDOM', 'pascagoula': 'United States', 'haikou': 'China', 'muzaffarabad': 'Pakistan', 'peterborough': 'UNITED KINGDOM', 'xinjiang': 'China', 'zhengzhou': 'China', 'leesburg': 'United States', 'coventry': 'UNITED KINGDOM', 'bombay': 'India', 'alor setar': 'Malaysia', 'huangshi shi': 'China', 'zaporizhzhia': 'Ukraine', 'zveqan': 'KOSOVO', 'greenbelt': 'United States', 'bathgate': 'United Kingdom', 'sudley springs': 'United States', 'rinala khurd': 'Pakistan', 'chepstow': 'UNITED KINGDOM', 'farnham': 'UNITED KINGDOM', 'rio grande': 'Puerto Rico', 'tunbridge wells': 'UNITED KINGDOM', 'kemerovo': 'Russia', 'englewood': 'United States', 'am dafock': 'Central African Republic', 'stockport': 'UNITED KINGDOM', 'urussu': 'Russia', 'solihull': 'UNITED KINGDOM', 'khan yunis': 'Palestine', 'anqing city': 'China', 'kathmandu': 'Nepal', 'yekaterinburg': 'Russia', 'hull': 'UNITED KINGDOM', 'abergavenny': 'UNITED KINGDOM', 'austin': 'United States', 'charlotte': 'United States', 'ningbo': 'China', 'changde city': 'China', 'gradiska': 'Bosnia and Herzegovina', 'ogden': 'United States', 'yueqing city': 'China', 'chicago': 'United States', 'sumter': 'United States', 'bridgwater': 'UNITED KINGDOM', 'kabi̇l i̇li̇': 'AFGHANISTAN', 'morristown': 'United States of America', 'norwich': 'UNITED KINGDOM', 'dawei': 'MYANMAR', 'smolevichi': 'Belarus', 'tangerang selatan': 'Indonesia', 'garrisonville': 'United States', 'yaroslavl': 'Russia', 'taunggyi': 'Myanmar', 'cardiff': 'UNITED KINGDOM', 'kobenhavn': 'Denmark', 'southampton': 'UNITED KINGDOM', 'st julians': 'Malta', 'unadilla': 'United States', 'southaven': 'UNITED STATES OF AMERICA', 'quillacollo': 'Bolivia', 'yueyang': 'China', 'waltham cross': 'UNITED KINGDOM', 'southall': 'UNITED KINGDOM', 'yorktown': 'United States', 'newcastle upon tyne': 'UNITED KINGDOM', 'temperanceville': 'United States', 'neftekumsk': 'Russia', 'miass': 'Russia', 'seoul': 'SOUTH KOREA', 'cundinamarca': 'Colombia', 'ashrafiyat sahnaya': 'Syria', 'gzira': 'Malta', 'linlithgow': 'UNITED KINGDOM', 'rogachev city': 'Belarus', 'parsippany': 'United States', 'zunyi city': 'China', 'durham': 'UNITED KINGDOM', 'cajicá': 'Colombia', 'naryan-mar': 'Russia', 'amsterdam': 'Netherlands', 'culpeper': 'United States', 'katy': 'United States', 'colon': 'Panama', 'freetown': 'Sierra Leone', 'bicester': 'UNITED KINGDOM', 'ratnapura': 'SRI LANKA', 'west palm beach': 'United States', 'lalitpur': 'Nepal', 'loikaw': 'Myanmar [Burma]', 'dublin': 'Ireland', 'montevideo': 'Uruguay', 'downpatrick': 'UNITED KINGDOM', 'marlow': 'United Kingdom', 'tangerang': 'Indonesia', 'innopolis': 'Russia', 'vladikavkaz': 'Russia', "sana'a": 'Yemen', 'qinhuangdao city': 'China', 'nabatieh': 'Lebanon', 'clacton-on-sea': 'UNITED KINGDOM', 'south croydon': 'UNITED KINGDOM', 'luton': 'UNITED KINGDOM', 'perm': 'Russia', 'denton': 'United States', 'riyadh': 'Saudi Arabia', 'willenhall': 'UNITED KINGDOM', 'canvey island': 'UNITED KINGDOM', 'newry': 'UNITED KINGDOM', 'bryansk': 'Russia', 'zhukovsky': 'Russia', 'warsaw': 'United States', 'skopje': 'North Macedonia', 'warrington': 'UNITED KINGDOM', 'wuhu city': 'China', 'altrincham': 'UNITED KINGDOM', 'idlib': 'Syria', 'saransk': 'Russia', 'isleworth': 'UNITED KINGDOM', 'matamoros': 'MEXICO', 'borehamwood': 'United Kingdom', 'newtownards': 'UNITED KINGDOM', 'ndélé': 'Central African Republic', 'kansas city': 'United States', 'karamay': 'China', 'foster city': 'United States', 'high wycombe': 'UNITED KINGDOM', 'new britain': 'United States', 'tadmer': 'Syria', 'wembley': 'UNITED KINGDOM', 'aley': 'LEBANON', 'chesterfield': 'United States', 'washington, d.c.': 'United States', 'yantarny': 'Russia', 'gainesville': 'United States', 'zibo city': 'China', 'culiacan': 'Mexico', 'east brunswick': 'United States', 'pembroke': 'UNITED KINGDOM', 'umm salal': 'Qatar', 'graham': 'United States', 'basel': 'Switzerland', 'kunming city': 'China', 'barnet': 'UNITED KINGDOM', 'hastings': 'UNITED KINGDOM', 'kiev': 'Ukraine', 'lianyungang': 'China', 'amelia': 'United States', 'haren (ems)': 'Germany', 'kenilworth': 'UNITED KINGDOM', 'grand cayman': 'Cayman Islands', 'versoix': 'Switzerland', 'volkovysk': 'Belarus', 'jiangyin': 'China', 'buckie': 'United Kingdom', 'sao paulo': 'Brazil', 'daman': 'India', 'waterlooville': 'UNITED KINGDOM', 'korramshahr': 'Iran', 'saratov': 'Russia', 'jinan city': 'China', 'harbin': 'China', 'sansha city': 'China', 'bridgeton': 'United states', 'phoenix': 'United States', 'guilin': 'China', 'perth': 'Australia', 'garissa': 'Kenya', 'gros islet': 'ST. LUCIA', 'telford': 'UNITED KINGDOM', 'cangzhou': 'China', 'windhoek': 'Namibia', 'electrostal': 'Russia', 'rickmansworth': 'United Kingdom', 'arkhangelsk': 'Russia', 'bournemouth': 'UNITED KINGDOM', 'preston': 'UNITED KINGDOM', 'noida': 'INDIA', 'guatemala city': 'Guatemala', 'blairgowrie': 'UNITED KINGDOM', 'san josé': 'Costa Rica', 'road town': 'BRITISH VIRGIN ISLAND', 'aleksin': 'RUSSIAN FEDERATION', 'motherwell': 'United Kingdom', 'haripur': 'Pakistan', 'bhubaneshwar': 'INDIA', 'kurchatov': 'Russia', 'fairfax station': 'United States', 'guildford': 'UNITED KINGDOM', 'denia': 'SPAIN', 'shwe kokko': 'Myanmar', 'gravesend': 'UNITED KINGDOM', 'kozmodemyansk': 'Russia', 'xi’an': 'China', 'city of london': 'United Kingdom', 'fujairah': 'United Arab Emirates', 'virginia beach': 'United States', 'hunslow': 'UNITED KINGDOM', 'gateshead': 'UNITED KINGDOM', 'ras el matn': 'Lebanon', 'gurugram': 'India', 'tilbury': 'UNITED KINGDOM', 'esfahan': 'Iran', 'hergiswil': 'Switzerland', 'ughelli': 'Nigeria', 'nanning': 'China', 'anyang-si': 'SOUTH KOREA', 'irvington': 'United States', 'gloucester': 'UNITED KINGDOM', 'eastbourne': 'UNITED KINGDOM', 'albu kamal': 'Syria', 'mashhad': 'Iran', 'kuwait city': 'Kuwait', 'acton park': 'Australia', 'southokkalapa': 'Myanmar', 'schulenburg': 'United States', 'guigang city': 'CHINA', 'xiamen city': 'China', 'azzan': 'YEMEN', 'managua': 'Nicaragua', 'plano': 'United States', 'rosarito': 'Mexico', 'fort worth': 'United States', 'ivanovo': 'Russia', 'rostov-na-donu': 'Russia', 'terreton': 'United States', 'garland': 'United States', 'tamarac': 'United States', 'maidstone': 'UNITED KINGDOM', 'hialeah': 'United States', 'zenica': 'Bosnia and Herzegovina', 'staten island': 'United States', 'orange': 'United States', 'daventryz': 'United Kingdom', 'jingdezhen': 'China', 'ankara': 'Turkey', 'landover': 'United States', 'spalding': 'UNITED KINGDOM', 'bangui': 'Central African Republic', 'los angeles': 'United States', 'rongmei town': 'China', 'stoke-on-trent': 'UNITED KINGDOM', 'leamington spa': 'UNITED KINGDOM', 'shantou': 'China', 'aurora': 'United States', 'mumbai': 'India', 'hanzhong city': 'China', 'hayes': 'UNITED KINGDOM', 'staryy oskol': 'Russia', 'tolyatti': 'Russia', 'guadalajara': 'Mexico', 'homs': 'Syria', 'east grinstead': 'UNITED KINGDOM', 'glen burnie': 'United States', 'hamilton': 'Bermuda', 'owings mills': 'United States', 'adm. jakarta selatan': 'Indonesia', 'nuevo laredo': 'Mexico', 'settle': 'UNITED KINGDOM', 'edgware': 'UNITED KINGDOM', 'dunmow': 'United Kingdom', 'durban': 'South Africa', 'carouge': 'SWITZERLAND', 'la habana': 'Cuba', 'derna': 'Libya', 'atlanta': 'United States', 'guangzhou city guangdong province': 'China', 'jersey city': 'United States', 'buenos aires': 'Argentina', 'catia la mar': 'Venezuela', 'zhodino': 'Belarus', 'milpitas': 'United States', 'upper marlboro': 'United States', 'baabda': 'Lebanon', 'mechanicsville': 'United States', 'bratislava': 'SLOVAK REPUBLIC', 'port talbot': 'UNITED KINGDOM', 'northampton': 'UNITED KINGDOM', 'wolverhampton': 'UNITED KINGDOM', 'eatonton': 'United States', 'baildon': 'UNITED KINGDOM', 'lower hutt': 'New Zealand', 'turfan city': 'China', 'jalabad': 'Afghanistan', 'bengaluru': 'India', 'chekyabinsk': 'Russia', 'irving': 'United States', 'stockholm': 'Sweden', 'magway': 'Myanmar [Burma]', 'bethesda': 'United States', 'boston': 'United States', 'dzerzhinsk': 'Russia', 'rawalpindi': 'Pakistan', 'bamako': 'Mali', 'tunis': 'Tunisia', 'louisville': 'United States', 'galich': 'Russia', "bishop's stortford": 'UNITED KINGDOM', 'coral gables': 'United States', 'shah alam': 'Malaysia', 'horsham': 'UNITED KINGDOM', 'richmond upon thames': 'UNITED KINGDOM', 'hartlepool': 'UNITED KINGDOM', 'guatemala city (cuidad de guatemala)': 'Guatemala', 'weston-super-mare': 'UNITED KINGDOM', 'taicang': 'China', 'newton aycliffe': 'UNITED KINGDOM', 'zhejiang': 'China', 'kettering': 'UNITED KINGDOM', 'kazan': 'Russia', 'oryol': 'Russia', 'luoyang city': 'China', 'akhtubinsk': 'Russia', 'swindon': 'UNITED KINGDOM', 'anshun': 'China', 'sungai udang': 'Malaysia', 'tallahassee': 'United States', 'auburn': 'United States', 'zhongshan': 'China', 'lima': 'Peru', 'guangzhou shi': 'China', 'edenbridge': 'UNITED KINGDOM', 'petaling jaya': 'Malaysia', 'dundee': 'United Kingdom', 'ramenskoe': 'Russia', 'bangalore': 'India', 'kabul city': 'Afghanistan', 'orlando': 'United States', 'brazzaville': 'Congo, Republic of the', 'yibin city': 'China', 'colombo': 'Sri Lanka', 'wytheville': 'United States', 'hamburg': 'Germany', 'sutton coldfield': 'UNITED KINGDOM', 'whitley bay': 'United Kingdom', 'lhasa': 'China', 'minneapolis': 'United States', 'orsha': 'Belarus', 'rio claro': 'Trinidad and Tobago', 'chesham': 'UNITED KINGDOM', 'weybridge': 'UNITED KINGDOM', 'trubchevsk': 'Russia', 'urumqi city': 'China', 'chita': 'Russia', 'hong kong': 'Hong Kong', 'newcastle-under-lyme': 'UNITED KINGDOM', 'panjin city': 'China', "qian 'an city": 'China', 'obninsk': 'Russia', 'vakaga': 'CENTRAL AFRICAN REPUBLIC', 'south ockendon': 'UNITED KINGDOM', 'san francisco': 'United States', 'zavolzhye': 'Russia', 'komsomolsk on amur': 'RUSSIA', 'arequipa': 'PERU', 'concord': 'United States', 'belgrade': 'Serbia', 'tianchang': 'China', 'manila': 'Philippines', 'ashburn': 'United States', 'izhevsk': 'Russia', 'smolensk': 'Russia', 'banja luka': 'Bosnia and Herzegovina', 'knoxville': 'United States', 'ciudad juarez': 'Mexico', 'hopa': 'REPUBLIC OF TÜRKIYE', 'nottingham': 'UNITED KINGDOM', 'volsk': 'Russia', 'naypyidaw': 'Myanmar', 'dandong': 'China', 'tijuana': 'MEXICO', 'benfleet': 'UNITED KINGDOM', 'ash shihr': 'Yemen', 'nanjing city': 'China', 'parral': 'Mexico', 'hallandale beach': 'United States', 'dubna': 'Russia', 'ulyanovsk': 'Russia', 'west columbia': 'UNITED STATES OF AMERICA', 'weifang': 'China', 'nanyang': 'China', 'accrington': 'UNITED KINGDOM', 'congleton': 'UNITED KINGDOM', 'great falls': 'United States', 'charlestown': 'Saint Kitts and Nevis', 'mersin': 'Turkey', 'kennesaw': 'United States', 'pyay': 'MYANMAR', 'ioannina': 'GREECE', 'tasikmalaya': 'Indonesia', 'nikolskoye': 'Russia', 'stourbridge': 'UNITED KINGDOM', 'phu ly': 'Vietnam', 'bastrop': 'United States', 'scottsdale': 'United States', 'marieville': 'Canada', 'sisli': 'Turkey', 'caguas': 'United States', 'kyoto': 'Japan', 'marrero': 'United States', 'market rasen': 'United Kingdom', 'fleet': 'UNITED KINGDOM', 'ras al khaimah': 'United Arab Emirates', 'windsor': 'UNITED KINGDOM', 'dongguan city': 'China', 'bingley': 'United Kingdom', 'apex': 'United States', 'sykesville': 'United States', 'alcester': 'UNITED KINGDOM', 'alpena': 'United States', 'dolgoprudny': 'Russia', 'jakata': 'Indonesia', 'fort lauderdale': 'United States', 'pacoima': 'United States', 'jingmen city': 'CHINA', 'boise': 'United States', 'maidenhead': 'UNITED KINGDOM', 'harrisburg': 'United States', 'nizhniy novgorod': 'Russia', 'raqqah': 'Syria', 'monticello': 'United States', 'zhangzhou': 'China', 'salisbury': 'UNITED KINGDOM', 'lewes': 'UNITED KINGDOM', 'nanping': 'CHINA', 'dagenham': 'UNITED KINGDOM', 'montgomery': 'United States', 'longnan city': 'China', 'mc lean': 'United States', 'manama': 'Bahrain', 'newport': 'UNITED KINGDOM', 'mbabane': 'Eswatini', 'missouri city': 'United States', 'tyre': 'Lebanon', 'pyongyang city': 'NORTH KOREA', 'grantham': 'UNITED KINGDOM', 'erbil': 'Iraq', 'zhuzhou city': 'China', 'brooklyn': 'United States', 'krasnogorsk': 'Russia', 'urmary': 'Russia', 'sheridan': 'United States', 'az zabadani': 'Syria', 'jacksonville': 'United States', 'bristow': 'United States', 'south okkalapa township': 'Myanmar', 'croydon': 'UNITED KINGDOM', 'bridgnorth': 'UNITED KINGDOM', 'crawley': 'UNITED KINGDOM', 'san antonio': 'United States', 'waltham': 'United States', 'amman': 'Jordan', 'oakland park': 'United States', 'frisco': 'United States', 'chaman': 'Pakistan', 'islamabad': 'Pakistan', 'glendale': 'United States', 'damiette': 'Egypt', 'ariana': 'Tunisia', 'suihua': 'China', 'york': 'UNITED KINGDOM', 'mansehra': 'Pakistan', 'suisun city': 'United States', 'solan': 'India', 'morden': 'UNITED KINGDOM', 'union city': 'United States', 'severdonetsk': 'Ukraine', 'cianjur': 'Indonesia', 'woodbridge': 'United States', 'lawton': 'United States', 'addlestone': 'United Kingdom', 'ningde': 'China', 'yantai': 'China', 'xuzhou': 'China', 'colonial heights': 'United States', 'vientiane capital': 'LAOS', 'gaza city': 'Palestine', 'lancy': 'SWITZERLAND', 'chatsworth': 'United States', 'florence': 'United States', 'dandong city': 'China', 'castries': 'ST. LUCIA', 'manilva': 'SPAIN', 'campo de criptana': 'SPAIN', 'okehampton': 'UNITED KINGDOM', 'wellingborough': 'UNITED KINGDOM', 'al kharaj': 'SAUDI ARABIA', 'ayr': 'UNITED KINGDOM', 'wah': 'Pakistan', 'newport-on-tay': 'UNITED KINGDOM', 'bonn': 'Germany', 'kuitun': 'China', 'masbate': 'PHILIPPINES', 'xingtai city': 'China', 'monroe': 'United States', 'esenyurt': 'Turkey', 'gaddab': 'KENYA', 'almaty': 'Kazakhstan', 'murino': 'Russia', 'near lincon': 'United Kingdom', 'romford': 'UNITED KINGDOM', 'dayr az zawr': 'Syria', 'exeter': 'UNITED KINGDOM', 'waukegan': 'United States', 'jiangyin city': 'China', 'wenchang': 'China', 'uglich': 'Russia', 'dangyang city': 'China', 'harrisonburg': 'United States', 'janesville': 'United States', 'sosnovy bor': 'Russia', 'dzerzhinskoe': 'Russia', 'melton mowbray': 'UNITED KINGDOM', 'klerksdorp': 'South Africa', 'brough': 'UNITED KINGDOM', 'vladimir': 'Russia', 'al-qaim': 'Iraq', 'redcar': 'United Kingdom', 'kachug': 'Russia', 'kidderminster': 'United Kingdom', 'cumnock': 'UNITED KINGDOM', 'bakirkoy': 'Turkey', 'odintsovo': 'Russia', 'lianyuan city': 'CHINA', 'algiers': 'Algeria', 'krasnoturinsk': 'Russia', 'st.peterburg': 'RUSSIA', 'altay': 'China', 'santa cruz de la sierra': 'Bolivia', 'xinxiang city': 'China', 'dzerzhinsk nizhny': 'Russia', 'rye': 'United States', 'stavropol': 'Russia', 'granada': 'SPAIN', 'bromsgrove': 'UNITED KINGDOM', 'langfang': 'China', 'teykovo': 'Russia', 'caesarea': 'Israel', 'runcorn': 'UNITED KINGDOM', 'thaxton': 'United States', 'guwahati': 'India', 'lehigh acres': 'United States', 'm. chișinău': 'Moldova', 'st petersburg': 'Russia', 'taiyuan city': 'China', 'new york city': 'United States of America', 'lagos': 'Nigeria', 'yabroud': 'Syria', 'baotou': 'China', 'tehran city': 'Iran', 'tacoma': 'United States', 'rochester': 'UNITED KINGDOM', 'barnaul': 'Russia', 'perth amboy': 'United States', 'xuchang': 'China', 'stockton-on-tees': 'UNITED KINGDOM', 'worksop': 'United Kingdom', 'sergiev posad': 'Russian Federation', 'abingdon': 'United States', 'tashkent city': 'Uzbekistan', 'the city of sevastopol': 'Ukraine', 'miramshah': 'Pakistan', 'orem': 'United States', 'zaragosa nueva': 'Philippines', 'san diego': 'United States', 'hyde': 'UNITED KINGDOM', 'woking': 'UNITED KINGDOM', 'la crosse': 'United States', 'dezhou city': 'China', 'barcelona': 'Spain', 'ferryhill': 'UNITED KINGDOM', 'shenzen': 'China', 'surprise': 'United States', 'gereshk': 'Afghanistan', 'grand rapids': 'United States', 'alekseevka': 'Russia', 'malaga': 'SPAIN', 'jakarta selatan': 'Indonesia', 'rushden': 'United Kingdom', 'england': 'UNITED KINGDOM', 'andreevka': 'Russian Federation', 'mangshi': 'China', 'madrid': 'Spain', 'lianyungang city': 'China', 'jiaxing': 'China', 'bozhou': 'China', 'tshchyolkovo': 'Russia', 'palo alto': 'UNITED STATES OF AMERICA', 'mckinney': 'United States', 'king george': 'United States', 'west chester': 'United States', 'napoleonville': 'United States', 'zhoushan': 'China', 'tomsk': 'Russia', 'badamadow': 'Somalia', 'yoshkar-ola': 'Russia', 'reston': 'United States', 'southsea': 'UNITED KINGDOM', 'devizes': 'UNITED KINGDOM', 'sysert': 'Russia', 'carshalton': 'UNITED KINGDOM', 'volzhskiy': 'Russia', 'llantrisant': 'UNITED KINGDOM', 'londonderry': 'NORTHERN IRELAND (UNITED KINGDOM)', 'nuneaton': 'UNITED KINGDOM', 'quezon city': 'Philippines', 'guiyang city': 'China', 'khulna': 'Bangladesh', 'tallinn': 'Estonia', 'quito': 'Ecuador', 'yixing': 'China', 'hove': 'UNITED KINGDOM', 'kaduna': 'Nigeria', 'canberra city': 'Australia', 'sepahan city': 'IRAN', 'waukesha': 'United States', 'domodedovo': 'RUSSIAN FEDERATION', 'guanghan': 'China', 'carluke': 'UNITED KINGDOM', 'kaslik': 'LEBANON', 'belvedere': 'UNITED KINGDOM', 'battle ground': 'United States', 'yanji': 'China', 'kolkata': 'India', 'kyauktada': 'Myanmar', 'west bromwich': 'UNITED KINGDOM', 'dudinka': 'Russia', 'newport pagnell': 'United Kingdom', 'hillegom': 'Netherlands', 'oudtshoorn': 'South Africa', 'nassau': 'BAHAMAS', 'carlisle': 'United Kingdom', 'seattle': 'United States', 'bishkek city': 'KYRGYZSTAN', 'sihanoukville': 'Cambodia', 'johannesburg': 'South Africa', 'oktyabrskoe': 'Russia', 'fordingbridge': 'UNITED KINGDOM', 'cheltenham': 'UNITED KINGDOM', 'biloxi': 'United States', 'yichang': 'China', 'wenzhou city': 'China', 'valday': 'Russia', 'kensington': 'United States', 'kawthaung': 'Myanmar', 'karaj': 'Iran', 'saint-petersburg': 'Russia', 'bahan township': 'Myanmar [Burma]', 'jining city': 'China', 'sagaing': 'Myanmar [Burma]', 'fatih': 'Turkey', 'panama city': 'Panama', 'birkirkara': 'Malta', 'ulanqab': 'China', 'kent': 'UNITED KINGDOM', 'brigg': 'UNITED KINGDOM', "guang'an": 'China', 'rogachev': 'Belarus', 'guangdong province': 'China', 'philadelphia': 'United States', 'safonovo': 'Russia', 'jinzhou city': 'China', 'kota semarang': 'Indonesia', 'linhai': 'China', 'williamsburg': 'United States', 'sofia': 'Bulgaria', 'xianyang': 'China', 'babruisk': 'Belarus', 'kabkabiya': 'SUDAN', 'blimbing': 'Indonesia', 'uxbridge': 'United Kingdom', 'wooster': 'United States', 'luxembourg': 'Luxembourg', 'maple grove': 'United States', 'rajkot': 'India', 'severodvinsk': 'Russia', 'kashi city': 'China', 'luxemburg city': 'LUXEMBOURG', 'south hill': 'United States', 'tunis tunisia': 'TUNISIA', 'guizhou': 'China', 'southwell': 'UNITED KINGDOM', 'yiwu': 'China', 'western cape town': 'South Africa', 'sumedang': 'Indonesia', 'kaluga': 'Russia', 'worthing': 'UNITED KINGDOM', 'capitol heights': 'United States', 'keighley': 'UNITED KINGDOM', 'yichang city': 'China', 'mazatlan': 'Mexico', 'dekalb': 'United States', 'sanming city': 'China', 'san bernardino': 'United States', 'goma': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'yinchuan city': 'China', 'baran': 'Belarus', 'oxford': 'UNITED KINGDOM', 'xi’an city': 'CHINA', 'raqqa': 'Syria', 'la canada': 'United States', 'kulebaki': 'RUSSIA', 'santa cruz': 'Bolivia', 'nakhodka': 'RUSSIAN FEDERATION', 'xinjiang uygur autonomous region': 'China', 'carletonville': 'South Africa', 'tbilisi': 'Georgia', 'downey': 'United States', 'changzhou': 'China', 'innsbruck': 'Austria', 'arak': 'Iran', 'baishan': 'China', 'puerto vallarta': 'Mexico', 'birao': 'Central African Republic', 'alanya': 'Turkey', 'st louis': 'United States', 'whitestown': 'United States', 'beltsville': 'United States', 'shinjuku-ku': 'Japan', 'oldham': 'UNITED KINGDOM', 'danville': 'United States', 'nefteyugansk': 'Russia', 'waterbury': 'United States', 'doha': 'Qatar', 'huainan': 'China', 'zhengzhou area': 'China', 'parchin': 'IRAN', 'middlesbrough': 'UNITED KINGDOM', 'medan belawan': 'Indonesia', 'van nuys': 'United States', 'steinhausen': 'SWITZERLAND', 'são paulo': 'Brazil', 'keysville': 'United States', 'henrico': 'United States', 'troon': 'UNITED KINGDOM', 'cirebon': 'Indonesia', 'harat hurayk': 'Lebanon', 'lurgan': 'UNITED KINGDOM', 'khartoum': 'Sudan', 'zhengzhou city': 'China', 'hinckley': 'UNITED KINGDOM', 'zibo': 'China', 'lanao del sur': 'PHILIPPINES', 'chalatenango': 'El Salvador', 'baotou city': 'China', 'torbali': 'Turkey', 'lubbock': 'United States', 'gazantiep': 'Turkey', 'melitopol': 'Ukraine', 'atimonana': 'Philippines', 'cdmx': 'Mexico', 'panabo city': 'PHILIPPINES', 'ndjamena': 'Chad', 'lakewood': 'United States', 'shipley': 'United Kingdom', 'aleksin town': 'RUSSIAN FEDERATION', 'taganrog': 'Russia', 'lake oswego': 'United States', 'mendham': 'United States of America', 'chêne-bougeries': 'SWITZERLAND', 'belogorsk': 'Russia', 'tarim': 'Yemen', 'beranang': 'Malaysia', 'tambov': 'Russia', 'andover': 'United Kingdom', 'zhigulyovsk': 'Russia', 'milton keynes': 'UNITED KINGDOM', 'kastrup': 'Denmark', 'detroit': 'United States', 'rybinsk': 'Russia', 'bern': 'SWITZERLAND', 'san gwann': 'Malta', 'lymington': 'United Kingdom', 'cleethorpes': 'UNITED KINGDOM', 'wigan': 'UNITED KINGDOM', 'los mochis': 'Mexico', 'heyuan city': 'China', 'tewkesbury': 'UNITED KINGDOM', 'rochdale': 'UNITED KINGDOM', 'orsk': 'Russia', 'hounslow': 'UNITED KINGDOM', 'tyabb': 'AUSTRALIA', 'islamshahr': 'Iran', 'shetland': 'United Kingdom', 'port said': 'Egypt', 'monywa': 'Myanmar', 'greenfield': 'United States', 'changji hui autonomous prefecture': 'China', 'stupino': 'RUSSIAN FEDERATION', 'alar city': 'CHINA', 'pisco': 'Peru', 'ormskirk': 'UNITED KINGDOM', 'cheboksary': 'Russia', 'mitcheldean': 'UNITED KINGDOM', 'longyan': 'China', 'bole': 'China', 'jieyang city': 'China', 'coalville': 'UNITED KINGDOM', 'canberra': 'Australia', 'haining': 'China', 'port louis': 'Mauritius', 'shangrao city': 'China', 'dewsbury': 'UNITED KINGDOM', 'ikeja': 'NIGERIA', 'mont fleuri': 'Seychelles', 'tashkent': 'Uzbekistan', 'taizhou': 'China', 'tumshuq': 'China', 'tutayev': 'RUSSIA', 'leshan': 'China', 'new albany': 'United States', 'muridke': 'Pakistan', 'çaman': 'Pakistan', 'riverside': 'United States', 'quezaltenango': 'Guatemala', 'chiyah': 'Lebanon', 'bandar anzali': 'IRAN', 'beaconsfield': 'United Kingdom', 'sale': 'UNITED KINGDOM', 'fredericksbug': 'United States', 'charlottesville': 'United States', 'grays': 'UNITED KINGDOM', 'ojai': 'United States', 'khaldeh': 'LEBANON', 'falkirk': 'UNITED KINGDOM', 'wesson': 'United States', 'troy': 'United States', 'northfield': 'United States', 'georgetown': 'Guyana', 'nha trang': 'Vietnam', 'pearl': 'United States', 'whitby': 'UNITED KINGDOM', 'shiraz': 'Iran', 'loughton': 'UNITED KINGDOM', 'market harborough': 'UNITED KINGDOM', 'national city': 'United States', 'redditch': 'UNITED KINGDOM', 'parker': 'United States', 'hamedan': 'Iran', 'southend-on-sea': 'UNITED KINGDOM', 'southport': 'UNITED KINGDOM', 'raleigh': 'United States', 'cuernavaca': 'Mexico', 'addu city': 'MALDIVES', 'khorfakan': 'United Arab Emirates', 'banjul': 'Gambia', 'luzhou': 'China', 'martinez': 'United States', 'la marsa': 'TUNISIA', 'wujiang': 'CHINA', 'kajang': 'MALAYSIA', 'sayda guba': 'Russia', 'palmyra': 'United States', 'freeman': 'United States', 'callington': 'United Kingdom', 'al-hudaydah': 'Yemen', 'cape-town': 'SOUTH AFRICA', 'al hadath': 'Lebanon', 'holland': 'United States', 'xiaogan': 'China', 'arbroath': 'UNITED KINGDOM', 'grimsby': 'UNITED KINGDOM', 'blantyre': 'Malawi', 'margate': 'UNITED KINGDOM', 'retford': 'UNITED KINGDOM', 'slutsk': 'Belarus', 'greenford': 'UNITED KINGDOM', 'ludlow': 'UNITED KINGDOM', 'morley': 'UNITED KINGDOM', 'walikale': 'Democratic Republic of Congo', 'bahawalpur': 'Pakistan', 'cucuta': 'Colombia', 'haifa': 'Israel', 'newbern': 'United States', 'shelton': 'United States', 'bloomfield hills': 'United States', 'nowy tomysl': 'POLAND', 'bhubaneswar': 'India', 'harrogate': 'UNITED KINGDOM', 'meishan': 'China', 'penzance': 'United Kingdom', 'hainan': 'China', 'anaheim': 'United States', 'zhangzhou city': 'China', 'maloyaroslavets': 'Russia', 'fuyang': 'China', 'kiel': 'Germany', 'sudbury': 'UNITED KINGDOM', 'west fargo': 'United States', 'nanyang city': 'China', 'zhuhai': 'China', 'washington, dc': 'United States', 'oklahoma city': 'United States', 'monte vista': 'United States', 'gignac': 'France', 'jinzhou': 'China', 'pragu': 'Czech Republic', 'shenyang city': 'China', 'tulsa': 'United States', 'xiangyang': 'China', 'muscat': 'Oman', 'volgograd': 'Russia', 'distrito federal': 'Mexico', 'tsuen wan': 'HONG KONG', 'vancouver': 'Canada', 'ashton-under-lyne': 'UNITED KINGDOM', 'rancho cucamonga': 'United States', 'changji city': 'China', 'loughborough': 'UNITED KINGDOM', 'ordos city': 'China', 'rogers': 'United States', 'madison heights': 'United States', 'tanga': 'Tanzania', 'eysins': 'Switzerland', 'nasr': 'PALESTINE (WEST BANK-GAZA)', 'hohhot': 'China', 'north branch': 'United States', 'pasig city': 'Philippines', 'al mukalla': 'Yemen', 'aksu': 'China', 'kandahar': 'Afghanistan', 'golbasi': 'Turkey', 'aracaju': 'Brazil', 'hungnam': 'North Korea', 'xianxiang city': 'China', 'ocean springs': 'United States', 'clewiston': 'United States', 'buzuluk': 'Russia', 'heyuan': 'China', 'balei': 'Russia', 'garden grove': 'United States', 'stafford': 'United States', 'hatay': 'SYRIA', 'rajshahi': 'Bangladesh', 'gus khrustalnyy': 'Russia', 'spotsylvania': 'United States', 'merkez': 'Turkey', 'navi mumbai': 'India', 'wujiaqu': 'China', 'gatchina': 'Russia', 'guayaquil': 'Ecuador', 'korla': 'China', 'harvey': 'United States', 'qishan city': 'CHINA', 'pskov': 'Russia', 'xiangtan': 'China', 'zapopan': 'Mexico', 'kishangarh': 'INDIA', 'woodford green': 'United Kingdom', 'triesen': 'Liechtenstein', 'huaraz': 'Peru', 'hollywood': 'United States', 'jiaxing city': 'China', 'wallingford': 'UNITED KINGDOM', 'nanning city': 'China', 'mbaiki': 'Central African Republic', 'swansea': 'UNITED KINGDOM', 'college station': 'United States', 'mckenney': 'United States', 'fernandina beach': 'United States', 'lviv': 'Ukraine', 'kutum': 'Sudan', 'herne bay': 'UNITED KINGDOM', 'brisbane city': 'Australia', 'cupertino': 'United States', 'nur-sultan': 'Kazakhstan', 'dudley': 'UNITED KINGDOM', 'kashgar': 'China', 'addis ababa': 'Ethiopia', 'bryan': 'UNITED STATES OF AMERICA', 'kilinochchi': 'Sri Lanka', 'zhumadian': 'China', 'boca raton': 'United States', 'khotkovo': 'Russia', 'gubkinsky': 'Russia', 'sanya city': 'CHINA', 'tirana': 'Albania', 'melbourne vic': 'AUSTRIA', 'laurel': 'United States', 'banstead': 'UNITED KINGDOM', 'chisinau': 'Moldova', 'strabane': 'UNITED KINGDOM', 'blackpool': 'UNITED KINGDOM', 'zahle': 'Lebanon', 'bury': 'UNITED KINGDOM', 'gorno-altaysk': 'Russia', 'beloozersky town': 'Russian Federation', 'evington': 'United States', 'rockford': 'United States', 'ely': 'United Kingdom', 'barking': 'UNITED KINGDOM', 'tlajomulco de zúñiga': 'Mexico', 'city panama': 'Panama', 'sowerby bridge': 'United Kingdom', 'stockton on tees': 'UNITED KINGDOM', 'mudanjiang': 'China', 'zelenodolsk': 'Russia', 'syzran': 'Russia', 'cannon falls': 'United States', 'montero-santa cruz': 'Bolivia', 'krasnoarmeysk': 'Russian Federation', 'queens': 'United States', 'calabasas': 'United States', 'carson city': 'United States', 'normanton': 'UNITED KINGDOM', 'dingzhou': 'China', 'stevenage': 'UNITED KINGDOM', 'rezvanshahr': 'Iran', 'antananarivo': 'Madagascar', 'garabulli': 'Libya', 'zhukovskiy': 'Russia', 'kaohsiung': 'Taiwan', 'felixstowe': 'United Kingdom', 'anapa': 'Russia', 'kekedala': 'China', 'reynosa': 'Mexico', 'nizhnevartovsk': 'Russia', 'ulan-ude': 'Russia', 'coppell': 'UNITED STATES OF AMERICA', 'cheongju': 'SOUTH KOREA', 'santiago': 'Chile', 'fabens': 'UNITED STATES OF AMERICA', 'zhangjiakou': 'China', 'brussels': 'Belgium', 'sukoharjo': 'Indonesia', 'waterloo': 'United States', 'antrim': 'United Kingdom', 'coon rapids': 'United States', 'dingzhou city': 'China', 'irmo': 'United States', 'dezhou': 'China', 'azraa': 'Syria', 'flawil': 'SWITZERLAND', 'taoyuan': 'Taiwan', 'brentford': 'United Kingdom', 'borodino': 'Russia', 'lisburn': 'UNITED KINGDOM', 'ras al-khaimah': 'United Arab Emirates', 'mudanya': 'Turkey', 'launceston': 'AUSTRALIA', 'delémont': 'Switzerland', 'donetsk city': 'Ukraine', 'zaouiya': 'Libya', 'arcadia': 'United States of America', 'martinsville': 'United States', 'poughkeepsie': 'United States', 'alfreton': 'United Kingdom', 'préverenges': 'SWITZERLAND', 'winchester': 'United States', 'masala': 'Finland', 'tamworth': 'UNITED KINGDOM', 'shaoguan': 'China', 'herndon': 'United States', 'ventnor': 'UNITED KINGDOM', 'st peter port': 'Guernsey', 'aden': 'Yemen', 'morpeth': 'United Kingdom', 'altay city': 'China', 'burnham on sea': 'United Kingdom', 'brandon': 'United States', 'kalispell': 'United States', 'antwerp': 'Belgium', 'deal': 'United Kingdom', 'earlysville': 'United States', 'tosno': 'Russia', 'erie': 'United States', 'aiken': 'United States', 'quebec': 'Canada', 'belo horizonte': 'Brazil', 'sumber agung magetan': 'Indonesia', 'newcastle': 'UNITED KINGDOM', 'tampa': 'United States', 'mir ali': 'Pakistan', 'jinchang city': 'China', 'bury st. edmunds': 'UNITED KINGDOM', 'kolomna': 'Russia', 'suisan city': 'UNITED STATES OF AMERICA', 'aylesbury': 'UNITED KINGDOM', 'central': 'HONG KONG', 'heywood': 'United Kingdom', 'abbasieh': 'Lebanon', 'zamudio': 'Spain', 'harat hreik': 'Lebanon', 'khanty-mansiysk': 'Russia', 'pemik': 'Bulgaria', 'kearsley': 'UNITED KINGDOM', 'omdurman': 'Sudan', 'hampton': 'United States', 'tegucigalpa': 'Honduras', 'calhoun city': 'United States', 'orekhovo-zuevo': 'Russia', 'conroe': 'United States', 'basseterre': 'ST. KITTS & NEVIS', 'kanpur': 'INDIA', 'adapazari': 'Turkey', 'chengde city': 'China', 'nevyanski raion': 'Russia', 'gulistan city': 'Uzbekistan', 'st augustine': 'United States of America', 'epalinges': 'Switzerland', 'portsmouth': 'United States', 'fomboni': 'COMOROS', 'gelendzhik': 'Russia', 'chorley': 'UNITED KINGDOM', 'willis': 'United States', 'wilson': 'United States', 'wallington': 'UNITED KINGDOM', 'mossel bay': 'SOUTH AFRICA', 'labao town': 'CHINA', 'deraa': 'Syria', 'fryazino': 'Russia', 'mexico city': 'Mexico', 'thanlyin': 'Myanmar [Burma]', 'vidnoe': 'Russia', 'chandler': 'United States', 'hanoi city': 'Vietnam', 'columbus': 'United States', 'sandton': 'South Africa', 'yongzhou city': 'China', 'iskenderun hatay': 'Turkey', 'wuhu': 'China', 'fall rivers': 'United States', 'new castle': 'United States', 'westlake village': 'United States', 'xinxiang': 'China', 'coleraine': 'NORTHERN IRELAND (UNITED KINGDOM)', 'yelabuga': 'Russia', 'princeton': 'United States', 'hiltons': 'United States', 'petrovsk': 'Russia', 'deyang city': 'China', 'lancaster': 'UNITED KINGDOM', 'visoko': 'Bosnia and Herzegovina', 'fairfax': 'United States', 'duesseldorf': 'GERMANY', 'mansfield': 'UNITED KINGDOM', 'silver spring': 'United States', 'jeddah': 'Saudi Arabia', 'glen allen': 'United States', 'busan': 'SOUTH KOREA', 'rockville': 'United States', 'aldan': 'Russia', 'catamarca': 'Argentina', 'ajmer': 'India', 'blacksburg': 'United States', 'thika': 'KENYA', 'fullerton': 'United States', 'kilmarnock': 'UNITED KINGDOM', 'ampthill': 'UNITED KINGDOM', 'orsky': 'Russia', 'newton-le-willows': 'United Kingdom', 'jiaozhou': 'China', 'dania beach': 'United States', 'basingstoke': 'UNITED KINGDOM', 'othello': 'UNITED STATES', 'lattika': 'Syria', 'dover': 'UNITED KINGDOM', 'kotovsk': 'Russia', 'bromwich': 'United Kingdom', 'gurgaon': 'India', 'jiujiang': 'China', 'cheshunt': 'United Kingdom', 'leninogorsk': 'Russia', 'craigavon': 'UNITED KINGDOM', 'sylmar': 'United States', 'south okkalapatownship': 'Myanmar', 'bedford': 'UNITED KINGDOM', 'shantou city': 'China', 'yushan town': 'China', 'izmir': 'Turkey', 'colchester': 'UNITED KINGDOM', 'madison': 'United States', 'votkinsk': 'RUSSIAN FEDERATION', 'baouchriyeh': 'Lebanon', 'baoding': 'China', 'halep': 'Syria', 'çankaya': 'TURKEY', 'sedley': 'United States', 'aberystwyth': 'UNITED KINGDOM', 'trenton': 'United States', 'esher': 'UNITED KINGDOM', 'burnsville': 'United States', 'lanzhou city': 'China', 'talinn': 'Estonia', 'roseau': 'Dominica', 'al rayyan': 'Qatar', 'kingston': 'Jamaica', 'gonda': 'INDIA', 'ramallah': 'PALESTINE (WEST BANK-GAZA)', 'hunt valley': 'United States', 'victoria': 'Seychelles', 'cheongju-si': 'Korea, South', 'amarillo': 'United States', 'sittingbourne': 'UNITED KINGDOM', 'méxico d.f.': 'Mexico', 'ascot': 'United Kingdom', 'almaty city': 'Kazakhstan', 'shatki': 'RUSSIAN FEDERATION', 'mount cotton': 'Australia', 'sambir': 'Ukraine', 'charleston': 'United States', 'xinyang city': 'China', 'tine': 'Sudan', 'schwyz': 'SWITZERLAND', 'champaign': 'United States', 'sao luis': 'BRAZIL', 'towcester': 'UNITED KINGDOM', 'zhumadian city': 'China', 'brownsville': 'United States', 'mamontovo': 'Russia', 'fort myers': 'United States', 'laredo': 'United States', 'taipei city': 'Taiwan', 'maltepe': 'Turkey', 'clifton': 'UNITED STATES', 'huzhou': 'China', 'santa ana': 'United States', 'borg el-arab': 'Egypt', 'lashkar gah': 'Afghanistan', 'crewe': 'UNITED KINGDOM', 'anshan': 'China', 'al-najaf al-ashraf': 'Iraq', 'nanjing shi': 'China', 'tipton': 'UNITED KINGDOM', 'leqing': 'China', 'chizhou': 'China', 'diyarbakir': 'TURKEY', 'clarksville': 'United States', 'kandalaksha': 'Russia', 'bonnyrigg': 'UNITED KINGDOM', 'yichan': 'China', 'smolyensk': 'Russia', 'bentonville': 'United States', 'laguna beach': 'United States', 'vratsa': 'Bulgaria', 'district heights': 'United States', 'orpington': 'UNITED KINGDOM', 'zhijiang city': 'China', 'lincoln': 'UNITED KINGDOM', 'benghazi': 'Libya', 'berlin': 'Germany', 'jieyang': 'China', 'wyoming': 'UNITED STATES OF AMERICA', 'uskudar': 'Turkey', 'boda': 'Central African Republic', 'yverdon-les-bains': 'Switzerland', 'kubinka': 'Russia', 'vilnius': 'Lithuania', 'central falls': 'United States', 'sanliurfa': 'Turkey', 'bedworth': 'UNITED KINGDOM', 'tupelo': 'United States', 'corsham': 'United Kingdom', 'woburn': 'United States', 'castleford west': 'United Kingdom', 'dungannon': 'United Kingdom', 'ordu': 'Turkey', 'iowa city': 'United States', 'mbujimayi': 'Congo (Democratic Republic of The)', 'oakton': 'United States', 'heihe city': 'China', 'huntingdon': 'UNITED KINGDOM', 'nyahururu': 'Kenya', 'tallin': 'ESTONIA', 'ontario': 'United States', 'tartus': 'SYRIA', 'huainan city': 'China', 'new orleans': 'United States', 'belfast': 'UNITED KINGDOM', 'waynesboro': 'United States', 'huntsville': 'United States', 'apo ae': 'UNITED STATES OF AMERICA', 'caerphilly': 'UNITED KINGDOM', 'city saveh': 'IRAN', 'halesowen': 'UNITED KINGDOM', 'myawaddy township': 'Myanmar', 'vaduz': 'Liechtenstein', 'zanjan': 'Iran', 'haren': 'Germany', 'beihai': 'China', 'jilin city': 'China', 'changshu': 'China', 'handan city': 'China', 'bogota d.c.': 'Colombia', 'pushchino': 'Russia', 'chino': 'United States', 'velikiy novgorod': 'Russia', 'shaoxing city': 'China', 'bad saarow': 'Germany', 'delhi': 'India', 'denpasar': 'Indonesia', 'big stone gap': 'United States', 'cermona': 'Italy', 'los reyes': 'Mexico', 'ishimbay': 'Russia', 'wicklow': 'Ireland', 'snezhinsk': 'Russia', 'city of st. pcity of st. petersburgetersburg': 'Russia', 'tacheng': 'China', 'xiangyang city': 'China', 'hebron': 'PALESTINE (WEST BANK-GAZA)', 'litchfield park': 'United States', 'moultrie': 'United States', 'odintsovo municipality': 'RUSSIAN FEDERATION', 'drew': 'United States', 'paisley': 'UNITED KINGDOM', 'la paz': 'Bolivia', 'meshginshahr': 'Iran', 'brierley hill': 'UNITED KINGDOM', 'delijan': 'Iran', 'chiang mai': 'Thailand', 'salvador': 'Brazil', 'engels': 'Russia', 'hami': 'China', 'cwmbran': 'United Kingdom', 'jurmala': 'Latvia', 'dollar': 'United Kingdom', 'manakin': 'United States', 'city of kaliningrad': 'Russia', 'pursat city': 'Cambodia', 'leigh-on-sea': 'UNITED KINGDOM', 'boonton': 'UNITED STATES OF AMERICA', 'kaliningrad': 'Russia', 'frome': 'UNITED KINGDOM', 'luzhou city': 'China', 'hong kong city': 'CHINA', 'santa clara': 'United States', 'gillingham': 'UNITED KINGDOM', 'poso': 'Indonesia', 'fergana': 'Uzbekistan', 'bellevue': 'United States', 'zaranj': 'Afghanistan', 'dorset': 'UNITED KINGDOM', 'helsinki': 'Finland', 'shushenskoe': 'Russia', 'new bedford': 'United States', 'ridgeway': 'United States', 'dumfries': 'United States', 'north humberside': 'United Kingdom', 'pittsburgh': 'United States', 'cape town': 'South Africa', 'maldon': 'United Kingdom', 'hampden': 'United States', 'north kingstown': 'United States', 'west point': 'United States', 'pershore': 'UNITED KINGDOM', 'hami city': 'China', 'jiujiang city': 'China', 'cohoes': 'United States', 'coulsdon': 'UNITED KINGDOM', 'collinsville': 'United States', 'sochi': 'Russia', 'hornchurch': 'UNITED KINGDOM', 'burton latimer': 'United Kingdom', 'sutton': 'UNITED KINGDOM', 'lampung bandar': 'INDONESIA', 'nevyansk': 'Russia', 'tonbridge': 'UNITED KINGDOM', 'bayrampasa': 'Turkey', 'lidingö': 'Sweden', 'taunton': 'UNITED KINGDOM', 'hungary': 'Hungary', 'lynch station': 'United States', 'calabar': 'Nigeria', 'taipei': 'Taiwan', 'amstelveen': 'Netherlands', 'saida': 'LEBANON', 'pasco': 'United States', 'summerville': 'United States', 'west zhuhai city': 'China', 'zhukov': 'Russia', 'fowey': 'UNITED KINGDOM', 'kogalym': 'Russia', 'modesto': 'United States', 'maykop': 'Russia', 'algonquin': 'United States', 'rensselaer': 'United States', 'magadan': 'Russia', "ya'an": 'CHINA', 'raichikhinsk': 'Russia', 'arua': 'Uganda', 'manassas park': 'United States', 'triangle': 'United States', 'huludao': 'China', 'oxted': 'UNITED KINGDOM', 'bago': 'Myanmar [Burma]', 'omidieh': 'Iran', 'bortala mongolian autonomous prefecture': 'China', 'ménaka': 'MALI', 'chong qing city': 'China', 'spokane valley': 'United States', 'kamensk-uralski': 'Russia', 'zamboanga city': 'Philippines', 'athens': 'GREECE', 'pervomayskiy': 'Russia', 'bolshoi kamen': 'Russia', 'heifei': 'CHINA', 'borisov': 'Belarus', 'tartous': 'Syria', 'norwalk': 'United States', 'gaoyou': 'China', 'pagnell': 'UNITED KINGDOM', 'st. julians': 'Malta', 'veliky novgorod': 'Russia', 'washington': 'United States', 'derevnya lesnaya polyana': 'Russia', 'alloa': 'UNITED KINGDOM', 'ust- dzheguta': 'RUSSIAN FEDERATION', 'mineralnye vody': 'Russia', 'troitsk': 'Russia', 'pittsburg': 'United States', 'mingora': 'Pakistan', 'yazd': 'IRAN', 'kasli': 'Russia', 'tal-kadi': 'India', 'zhenjiang city': 'China', 'jakarta': 'Indonesia', 'kizilsu kirgiz autonomous prefecture': 'China', 'menlo park': 'United States', 'foshan city': 'China', 'samut prakan': 'Thailand', 'wuppertal': 'GERMANY', 'allentown': 'United States', 'tacheng area': 'China', 'surabaya': 'Indonesia', 'nashville': 'United States', 'yibin': 'China', 'meeteetse': 'United States', 'providence forge': 'United States', 'bowie': 'United States', 'paterson': 'United States', 'borovichi': 'Russia', 'staunton': 'United States', 'tunus': 'Tunisia', 'gaithersburg': 'United States', 'kyzyl-kiya town': 'KYRGYZSTAN', 'emsworth': 'UNITED KINGDOM', 'scunthorpe': 'UNITED KINGDOM', 'komsomolsk-on-amur': 'Russia', 'mulino': 'RUSSIAN FEDERATION', 'noordwijk zuid-holland': 'Netherlands', 'catano': 'UNITED STATES OF AMERICA', 'shenzhen shi': 'China', 'shumerlya': 'Russia', 'berdsk': 'Russia', 'myeik': 'Myanmar', 'axminster': 'UNITED KINGDOM', 'adelaide': 'Australia', 'novorossiysk': 'Russia', 'dushanbe city': 'TAJIKISTAN', 'douglas': 'Isle of Man', 'feodosiya': 'Ukraine', 'fushun': 'China', 'fruitland': 'United States', 'iverness': 'UNITED KINGDOM', 'slidell': 'United States', 'ica': 'Peru', 'eyyubiye': 'Turkey', 'volzhski': 'Russia', 'newbury': 'UNITED KINGDOM', 'carmarthen': 'UNITED KINGDOM', 'east orange': 'United States', 'apatity': 'Russia', 'isfahan city': 'Iran', 'kherson': 'Ukraine', 'barranquilla': 'COLOMBIA', 'crook': 'United Kingdom', 'morgantown': 'United States', 'warri': 'Nigeria', 'odessa': 'United States', 'kirkland': 'United States', 'st. albans': 'United Kingdom', 'al suqaylabiya': 'SYRIA', 'magetan': 'Indonesia', 'bandung': 'Indonesia', 'scottsville': 'United States', 'kandahar city': 'Afghanistan', 'south bend': 'United States', 'alapaevsk': 'Russia', 'west drayton': 'UNITED KINGDOM', 'deyang': 'China', 'fort walton beach': 'United States', 'bellshill': 'UNITED KINGDOM', 'ferizaj': 'Kosovo', 'selby': 'United Kingdom', 'lattakia': 'Syria', 'pakokku': 'Myanmar [Burma]', 'bujumbura': 'BURUNDI', 'elabouga': 'RUSSIAN FEDERATION', 'monterey park': 'United States', 'huelva': 'Spain', 'thane': 'India', 'logansport': 'United States', 'sapele': 'Nigeria', 'poynton': 'United Kingdom', 'cangzhou city': 'China', 'new oxford': 'United States', 'cleckheaton': 'UNITED KINGDOM', 'buckley': 'UNITED KINGDOM', 'colebrook': 'United States', 'ryabinsk': 'Russia', 'east windsor': 'United States', 'warwick': 'UNITED KINGDOM', 'semarang': 'Indonesia', 'eugene': 'United States', 'baiyin city': 'China', 'goose creek': 'UNITED STATES OF AMERICA', 'corinth': 'United States', 'salekhard': 'Russia', 'sawbridgeworth': 'UNITED KINGDOM', 'cuttack': 'India', 'lemesos': 'Cyprus', 'mianzhu': 'China', 'tappahannock': 'United States', 'arnhem': 'Netherlands', 'lyubertsy': 'Russia', 'xianyang city': 'China', 'heyburn': 'United States', 'lashio': 'Myanmar', 'yancheng': 'China', 'digos city': 'PHILIPPINES', 'kyaing tong': 'MYANMAR', 'liyang': 'China', 'euless': 'UNITED STATES OF AMERICA', 'chifeng city': 'China', 'cranston': 'United States', 'zhanjiang': 'China', 'vyborg': 'Russia', 'qinzhou city': 'China', 'woods cross': 'United States', 'paramaribo': 'Suriname', 'kaw thaung': 'Myanmar', 'fuldatal': 'Germany', 'shahin shahr': 'Iran', 'north haven': 'United States', 'petworth': 'UNITED KINGDOM', 'abbeville': 'United States', 'rajshashi': 'BANGLADESH', 'essen': 'Germany', 'hub town': 'Pakistan', 'qingyuan': 'China', 'sofrino': 'RUSSIAN FEDERATION', 'podolsk': 'Russia', 'uttoxeter': 'UNITED KINGDOM', 'debary': 'United States', 'krasnoufimsk': 'Russia', 'grenada': 'United States', 'nacala-porto': 'Mozambique', 'kota malang': 'INDONESIA', 'velikiye luki': 'Russia', 'municipiul buzau': 'Romania', 'amparai': 'SRI LANKA', 'northhampton': 'United Kingdom', 'zlatoust': 'Russia', 'amherst': 'United States', "huai'an": 'China', 'tongren city': 'China', 'north shields': 'UNITED KINGDOM', 'yerevan': 'Armenia', 'kamyshin': 'Russia', 'covington': 'United States', 'ust-kalmanka': 'Russia', 'baldwin park': 'United States', 'clarksdale': 'United States', 'south san francisco': 'United States', 'steamboat springs': 'UNITED STATES OF AMERICA', 'christchurch': 'United Kingdom', 'guangdong': 'China', 'oshkosh': 'United States', 'myakka city': 'United States', 'yaoundé': 'Cameroon', 'lytkarino': 'Russia', 'dortmund': 'Germany', 'hanover': 'United States', 'bryson city': 'United States', 'zhoushan city': 'China', 'aksu city': 'China', "ya'an city": 'CHINA', 'fct-abuja': 'Nigeria', 'epsom': 'UNITED KINGDOM', 'moscow oblast': 'Russia', 'west peoria': 'United States', 'sarov': 'Russia', 'ryazan city': 'RUSSIAN FEDERATION', 'xilinhot': 'China', 'woodford': 'United States', 'malton': 'United Kingdom', 'los banos': 'PHILIPPINES', 'kyiv': 'Ukraine', 'emeryville': 'United States Of America', 'shangqiu': 'China', 'texarkana': 'United States', 'kansk': 'Russia', 'al-uqaylah': 'Kuwait', 'shikhany': 'Russia', 'walnut ridge': 'United States', 'yuzhno-sakhalinsk': 'Russia', 'widnes': 'United Kingdom', 'malmesbury': 'UNITED KINGDOM', 'dar es salaam': 'Tanzania', 'sukhumi': 'Georgia', 'torez city': 'UKRAINE', 'lisboa': 'Portugal', 'anguo city': 'China', 'são luis': 'Brazil', 'east cowes': 'United Kingdom', 'tempe': 'United States', 'murray': 'United States', 'bilston': 'UNITED KINGDOM', 'dalbandin': 'Pakistan', 'rak': 'UNITED ARAB EMIRATES', 'bandar mahshahr': 'Iran', 'zvezdny': 'Russia', 'satka': 'Russia', 'severomorsk': 'Russia', 'san luis potosi': 'Mexico', 'lynchburg': 'United States', 'granbury': 'United States', 'vantaa': 'Finland', 'zintan': 'Libya', 'cabot': 'United States', 'hailsham': 'UNITED KINGDOM', 'mogilev': 'Belarus', 'largo': 'United States', 'belize city': 'Belize', 'atlantic city': 'United States', 'singida': 'Tanzania', 'lafayette': 'United States', 'mattaponi': 'United States', 'polotsk': 'Belarus', 'zahedan': 'Iran', 'opa locka': 'UNITED STATES OF AMERICA', 'lexington': 'United States', 'new milton': 'UNITED KINGDOM', 'hartford city': 'United States', 'neath': 'UNITED KINGDOM', 'sosensky': 'Russia', 'svirsk': 'Russia', 'the esplanade perth': 'Australia', 'shangqiu city': 'China', 'ljubljana': 'Slovenia', 'vinton': 'United States', 'kaohsiung city': 'Taiwan', 'orenburg': 'Russia', 'manubah': 'Tunisia', 'overland park': 'United States', 'pechenga': 'Russia', 'yatai new city': 'Myanmar', 'oldsmar': 'United States', 'purfleet-on-thames': 'United Kingdom', 'dki jakarta': 'Indonesia', 'tortola': 'BRITISH VIRGIN ISLAND', 'porth': 'UNITED KINGDOM', 'shaoxing': 'China', 'worcester': 'UNITED KINGDOM', 'lome': 'TOGO (THE TOGOLESE REPUBLIC)', 'shuanghe': 'China', 'usinsk': 'Russia', 'ust-labinsk': 'Russian Federation', 'desnogorsk': 'Russia', 'west wickham': 'UNITED KINGDOM', 'malden': 'UNITED STATES OF AMERICA', 'yancheng city': 'China', 'liuzhou': 'China', 'jinghe new town': 'China', 'soligorsk': 'BELARUS', 'novosibirsk academic city': 'RUSSIAN FEDERATION', 'bludan': 'SYRIA', 'liuzhou city': 'China', 'locust grove': 'United States', 'pikeville': 'United States', 'brisbane': 'Australia', 'renqiu city': 'China', 'baidoa': 'Somalia', 'ashland': 'United States', 'hot springs': 'United States', 'seltso': 'RUSSIAN FEDERATION', 'skolkovo': 'Russia', 'cincinnati': 'United States', 'kamensk-uralskiy': 'Russia', 'strasburg': 'United States', 'xiaogan city': 'China', 'ibb': 'Yemen', 'annandale': 'United States', 'zheleznogorsk': 'Russia', 'hoffman estates': 'United States', 'smithfield': 'United States', 'buffalo': 'United States', 'qingdaon': 'China', 'hohhot city': 'CHINA', 'huangshan': 'China', 'knyaze-volkonskoe': 'Russia', 'canterbury': 'UNITED KINGDOM', 'halstead': 'UNITED KINGDOM', 'sion': 'SWITZERLAND', 'saint-prex': 'SWITZERLAND', 'cookstown': 'UNITED KINGDOM', 'bloomingdale': 'United States', 'santa rita': 'Brazil', 'stanmore': 'UNITED KINGDOM', 'vero beach': 'United States', 'peterlee': 'United Kingdom', 'asino': 'Russia', 'sterlitamak': 'Russia', 'shihezi city': 'China', 'vernon': 'United States', 'leyland': 'UNITED KINGDOM', 'corona': 'UNITED STATES OF AMERICA', 'bogor city': 'Indonesia', 'penza': 'Russia', 'pinheiro': 'Brazil', 'smethwick': 'UNITED KINGDOM', 'culver city': 'United States', 'azov': 'Russia', 'bangbu': 'China', 'suzhou shi': 'China', 'kushva': 'Russia', 'shar-e kord': 'Iran', 'zhodzina': 'Belarus', 'morowali': 'INDONESIA', 'nizhny tagil': 'Russia', 'mezcales': 'Mexico', 'jining': 'China', 'ostovets': 'Belarus', 'lebanon': 'United States', 'san juan city': 'Philippines', 'novoaltaysk': 'Russia', 'evpatoriia': 'Ukraine', 'beni territory': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'brewerville': 'Liberia', 'nezavisimosti': 'Belarus', 'palermo': 'ITALY', 'west malling': 'UNITED KINGDOM', 'anshun city': 'China', 'hattiesburg': 'United States', 'pontefract': 'UNITED KINGDOM', 'east york': 'Canada', 'yichun': 'China', 'sohar': 'Oman', 'farnborough': 'UNITED KINGDOM', 'middleton': 'United States', 'belgorod': 'Russia', 'solnechny': 'Russia', "xi 'an city": 'CHINA', 'wolseley': 'SOUTH AFRICA', 'rocky mount': 'United States', 'voluntari': 'Romania', 'rivas': 'Nicaragua', 'zarechny': 'Russia', 'znamensk': 'Russia', 'fuquay varina': 'United States', 'elkhart': 'United States', 'abakan': 'Russia', 'la mesa': 'United States', 'round rock': 'United States', 'jurupa valley': 'United States', 'middletown': 'United States', 'powhatan': 'United States', 'gerrards cross': 'UNITED KINGDOM', 'st. leonards-on-sea': 'United Kingdom', 'bluefield': 'United States', 'linzhou': 'China', 'sacramento': 'United States', 'xiamenn': 'China', 'port saint lucie': 'United States', 'olney': 'UNITED KINGDOM', 'dübendorf': 'SWITZERLAND', 'carrollton': 'United States', 'hanzhong': 'China', 'ridgeland': 'United States', 'rajshai': 'Bangladesh', 'zhenjiang': 'China', 'dongtai': 'China', 'penmaenmawr': 'United Kingdom', 'amersham': 'United Kingdom', 'atasehir': 'Turkey', 'centurion': 'SOUTH AFRICA', 'liaoning': 'CHINA', 'oranjestad': 'Aruba', 'middleborough': 'United Kingdom', 'cannock': 'UNITED KINGDOM', 'mudende': 'Rwanda', 'poshok': 'IRAQ', 'worcester park': 'UNITED KINGDOM', 'missoula': 'United States', 'jessup': 'United States', 'wesh': 'Afghanistan', 'shaowu': 'China', 'saint helier': 'Jersey', 'monterey': 'United States', 'jane lew': 'United States', 'gaobeidian': 'China', 'consett': 'UNITED KINGDOM', 'kostroma': 'Russia', 'thanh hoa city': 'Vietnam', 'far rockaway': 'United States', 'river falls': 'United States', 'jazan': 'Saudi Arabia', 'geneve': 'Switzerland', 'binzhou': 'China', 'qoqek': 'China', 'north chesterfield': 'United States', 'gao': 'MALI', 'chichester': 'UNITED KINGDOM', 'selangor': 'Malaysia', 'warwickshire': 'United Kingdom', 'diss': 'UNITED KINGDOM', 'zhanjiang city': 'China', 'markham': 'Canada', 'lanark': 'UNITED KINGDOM', 'plainsboro': 'United States', 'saint john': 'Canada', 'sanger': 'United States', 'bucuresti': 'Romania', 'guelma': 'Algeria', 'miram shah': 'Pakistan', 'kirishi': 'Russia', 'buxtehude': 'Germany', "tai'an": 'CHINA', 'lenexa': 'United States', 'pharr': 'United States', 'sweida': 'Syria', 'st. helens': 'UNITED KINGDOM', 'oswestry': 'UNITED KINGDOM', 'eshtehard': 'Iran', "n'djamena": 'Chad', 'burlingame': 'United States', 'city of industry': 'United States', 'ann arbor': 'United States', 'dinajpur': 'BANGLADESH', 'bogota': 'Colombia', 'gulfport': 'United States', 'lahore ci̇ty': 'PAKISTAN', 'ramsey': 'United States of America', 'wigton': 'UNITED KINGDOM', 'sunny isles beach': 'United States', 'bridport': 'UNITED KINGDOM', 'lyles': 'United States', 'ryde': 'UNITED KINGDOM', 'kota bima': 'INDONESIA', 'stony creek': 'United States', 'haymarket': 'United States', 'north kivu': 'CONGO (REPUBLIC OF THE)', 'montgomery park': 'United States', 'gaborone': 'Botswana', 'richmond hill': 'Canada', 'flossmoor': 'United States', 'amursk': 'Russia', 'didcot': 'UNITED KINGDOM', 'lomonosov': 'Russia', 'arnavutkoy': 'Turkey', 'gibsonville': 'United States', 'newhall': 'United States', 'george town': 'Malaysia', 'wallisellen': 'Switzerland', 'wareham': 'UNITED KINGDOM', 'santa fe springs': 'United States', 'barhamsville': 'United States', 'changzhi': 'China', 'framingham': 'United States', 'anyang': 'China', 'taksimo': 'Russia', 'meriden': 'United States', 'wien': 'Austria', 'ust-kamenogorsk city': 'Kazakhstan', 'chaghi': 'Pakistan', 'fujian': 'China', 'toprakkale': 'REPUBLIC OF TÜRKIYE', 'pakakkhu': 'MYANMAR', 'kota cirebon': 'Indonesia', 'chatswood': 'Australia', 'veneta': 'United States', 'littlehampton': 'UNITED KINGDOM', 'henderson': 'United States', 'dearborn': 'United States', 'jinah': 'Lebanon', 'manaus': 'Brazil', 'clinton': 'United States', 'nizhni novgorod': 'Russia', 'masjed soleiman': 'Iran', 'airdrie': 'UNITED KINGDOM', 'gammarth supérieur': 'Tunisia', 'zhlobin': 'Belarus', 'dongying city': 'China', 'oktyabrsky': 'Russia', 'spin boldak': 'Afghanistan', 'city yantai': 'China', 'genova': 'Italy', 'zhejiang province': 'China', 'gary': 'United States', 'murray hill': 'United States', 'aiea': 'United States', 'fushë kosovë': 'Kosovo', 'trowbridge': 'UNITED KINGDOM', 'cuyotenango': 'Guatemala', 'leicestershire': 'United Kingdom', 'north shield': 'UNITED KINGDOM', 'nouakchott': 'Mauritania', 'zeribat el oued': 'Algeria', 'corpus christi': 'United States', 'stirling': 'UNITED KINGDOM', 'kermanshah': 'Iran', 'galloway': 'United States', 'koln': 'Germany', 'isola': 'United States', 'madera': 'United States', 'lorton': 'United States', 'volchansk': 'Russia', 'gereshk city': 'Afghanistan', 'xabia': 'SPAIN', 'northbrook': 'United States', 'yichun city': 'CHINA', 'heze city': 'China', 'chihuahua': 'MEXICO', 'sandhurst': 'UNITED KINGDOM', 'okolona': 'United States', 'ramenskoye': 'RUSSIA', 'coatbridge': 'UNITED KINGDOM', 'poolesville': 'United States', 'aukland': 'NEW ZEALAND', 'fountain valley': 'United States', 'aventura': 'United States', 'humble': 'UNITED STATES OF AMERICA', 'central jakarta': 'Indonesia', 'incheh borun': 'IRAN', 'naberezhnye chelny': 'Russia', 'rindge': 'United States', 'vashon': 'United States', 'colorado springs': 'United States', 'yokohama': 'Japan', 'temecula': 'United States', 'houghton le spring': 'UNITED KINGDOM', 'sheerness': 'UNITED KINGDOM', 'rafah': 'Palestine', 'loudi': 'China', 'yuen long': 'China', 'zawiya': 'Libya', 'pathein': 'Myanmar', 'salmon': 'United States', 'pompano beach': 'United States', 'maghera': 'UNITED KINGDOM', 'stephenson': 'United States', 'lake charles': 'United States', 'petropavl': 'Kazakhstan', 'bahan': 'Myanmar', 'nizhny lomov': 'Russia', 'lugansk': 'Ukraine', 'korolov': 'RUSSIA', 'salkhad': 'Syria', 'encino': 'United States', 'larne': 'UNITED KINGDOM', 'berkhamsted': 'UNITED KINGDOM', 'stratham': 'United States', 'mukalla': 'Yemen', 'nantwich': 'UNITED KINGDOM', 'san juan': 'United States', 'des moines': 'United States', 'foz do iguacu': 'Brazil', 'bolshoy kamen': 'Russia', "ma'anshan": 'China', 'carmel': 'United States', 'fort collins': 'United States', 'al kharaitiyat': 'Qatar', 'agri': 'REPUBLIC OF TÜRKIYE', 'largs': 'United Kingdom', 'kolov': 'Russia', 'haslemere': 'UNITED KINGDOM', 'sunderland': 'UNITED KINGDOM', 'urmia': 'Iran', 'st laurent': 'Canada', 'clintwood': 'United States', 'lukhovitsy': 'Russian Federation', 'idilib': 'SYRIA', 'mogadishu': 'Somalia', 'waltham abbey': 'United Kingdom', 'bedlington': 'United Kingdom', 'hangzhou shi': 'China', 'enid': 'UNITED STATES OF AMERICA', 'macheng city': 'China', 'vavuniya': 'Sri Lanka', 'valencia': 'Spain', 'mon state': 'Myanmar [Burma]', 'staraya kupavna': 'Russia', 'littleton': 'United States', 'malmyzh': 'Russia', 'gomel': 'Belarus', 'mytishi': 'Russia', 'bergamo': 'Italy', 'elliston': 'United States', 'darwin city': 'Australia', 'burlington': 'United States', 'meridian': 'United States', 'avon': 'United States', 'tomilino': 'Russia', 'owasso': 'United States', 'folkestone': 'UNITED KINGDOM', 'knutsford': 'UNITED KINGDOM', 'skipton': 'UNITED KINGDOM', 'romsey': 'UNITED KINGDOM', 'naperville': 'United States', 'andalgalá': 'Argentina', 'north las vegas': 'United States', 'south shields': 'UNITED KINGDOM', 'ahmedabad': 'India', 'voula': 'Greece', 'fuxin': 'China', 'lufeng': 'CHINA', 'apia': 'Samoa', 'daina': 'Saudi Arabia', 'ocala': 'United States', 'accra': 'Ghana', 'radstock': 'UNITED KINGDOM', 'reno': 'United States', 'longford': 'United States', 'new territories': 'CHINA', 'lamitan': 'Philippines', 'trincomalee': 'Sri Lanka', 'nueva ecija': 'PHILIPPINES', 'jalalabad': 'Afghanistan', 'castlederg': 'UNITED KINGDOM', 'morrisville': 'United States', 'kingston upon thames': 'UNITED KINGDOM', 'karbala': 'Iraq', 'amlwch': 'UNITED KINGDOM', 'chantilly': 'United States', 'navlya': 'Russia', 'astana': 'Kazakhstan', 'evansville': 'United States', 'roseburg': 'UNITED STATES OF AMERICA', 'falls church': 'United States', 'wallasey': 'UNITED KINGDOM', 'putilkovo': 'Russia', 'marikina city': 'PHILIPPINES', 'kilkeel': 'UNITED KINGDOM', 'campbelltown': 'Australia', 'burscough': 'UNITED KINGDOM', 'novovoronezh': 'Russian Federation', 'jasper': 'United States', 'polyarny': 'Russia', 'parramatta': 'Australia', 'elgin': 'United States', 'kashira': 'Russia', 'nantong city': 'CHINA', 'mahe': 'Seychelles', 'nantong shi': 'China', 'meizhou city': 'China', 'zhuji': 'China', 'cusco': 'Peru', 'poselok gorodskogo tipa urussu': 'Russia', 'boldon colliery': 'United Kingdom', 'altay krai': 'Russia', 'katana': 'Syria', 'changzhi city': 'China', 'manningtree': 'UNITED KINGDOM', 'wilmslow': 'United Kingdom', 'atakpamé': 'Togo', 'stratford-upon-avon': 'UNITED KINGDOM', 'akesu city': 'China', 'murcia': 'SPAIN', 'bandar imam': 'IRAN', 'pocahontas': 'United States', 'buraydah': 'SAUDI ARABIA', 'willingboro': 'United States', 'grange-over-sands': 'UNITED KINGDOM', 'portageville': 'United States', 'anlu': 'China', 'narimanov': 'Russia', 'esenler': 'Turkey', 'north miami': 'UNITED STATES OF AMERICA', 'konstanz': 'Germany', 'linz': 'Austria', 'milford': 'United States', '吉隆玻': 'MALAYSIA', 'roslavl': 'Russia', 'pantego': 'United States', 'provideniya': 'Russia', 'northwich': 'United Kingdom', 'weihai city': 'China', 'memphis': 'United States', 'lipetsk': 'Russia', 'xianning': 'China', 'grand prairie': 'United States', 'zhuozhou': 'China', 'hulunbuir': 'China', 'chengdu shi': 'China', 'south point': 'United States', 'omaha': 'United States', 'ciudad de guatemala': 'Guatemala', 'aba': 'Nigeria', 'vineyard': 'UNITED STATES OF AMERICA', 'san fernando': 'United States', 'dianbai city': 'China', 'qu dalian': 'China', 'toano': 'United States', 'edison': 'United States', 'torquay': 'UNITED KINGDOM', 'chigwell': 'UNITED KINGDOM', 'laguna hills': 'United States', 'gangnam-gu': 'SOUTH KOREA', 'togliatti': 'Russia', 'jaya petaling jaya': 'MALAYSIA', 'conakry': 'GUINEA', 'grenoble': 'France', 'north judson': 'United States', 'spring': 'United States', 'nantong': 'China', 'taggerang selatan': 'Indonesia', 'zhubei': 'Taiwan', 'starkville': 'United States', 'yugra': 'RUSSIAN FEDERATION', 'cupar': 'UNITED KINGDOM', 'beitun': 'China', 'mezhdurechensk': 'Russia', 'nyaung oo': 'Myanmar [Burma]', 'icheon-si': 'South Korea', 'matagalpa': 'Nicaragua', 'selskoe poselenie kushalino': 'Russia', 'marjeyoun': 'LEBANON', 'jiangsu': 'China', 'woodbrdige': 'United States', 'zhuhai city': 'China', 'escazú': 'Costa Rica', 'cochabamba': 'Bolivia', 'roosendaal': 'NETHERLANDS', 'ivybridge': 'UNITED KINGDOM', 'aleppo': 'Syria', 'dongguan shi': 'China', 'iskenderun': 'REPUBLIC OF TÜRKIYE', 'medenine': 'Tunisia', 'kerch': 'Ukraine', 'ciudad de méxico': 'Mexico', 'novo saraybosna': 'Bosnia and Herzegovina', 'bengbu': 'China', 'tengzhou city': 'China', 'prague': 'Czech Republic', 'kazachyi lageri': 'Russia', 'falmouth': 'UNITED KINGDOM', 'jakarta selantan': 'INDONESIA', 'leyte': 'PHILIPPINES', 'shangcheng town': 'China', 'berezovsky': 'Russian Federation', 'travnik': 'Bosnia and Herzegovina', 'wirral': 'UNITED KINGDOM', 'ningde city': 'China', 'dammam': 'Saudi Arabia', 'va. beach': 'United States', 'miami beach': 'United States', 'olenegorsk': 'Russia', 'locust dale': 'United States', 'stoke on trent': 'UNITED KINGDOM', 'atherstone': 'UNITED KINGDOM', 'baldones novads': 'Latvia', 'sudoverf': 'Russia', 'bourj el barajneh': 'Lebanon', 'liski': 'Russia', 'tiverton': 'UNITED KINGDOM', 'suva': 'Fiji', 'kébili': 'Tunisia', 'hebi city': 'China', 'ayacucho': 'Peru', 'hamhung': 'North Korea', 'winston salem': 'United States', 'midland': 'UNITED STATES OF AMERICA', 'londra': 'United Kingdom', 'sergeant bluff': 'United States', 'fishersville': 'United States', 'sanaa yemen': 'Yemen', 'welwyn': 'UNITED KINGDOM', 'aledo': 'United States', 'gavrilkovo': 'Russia', 'winterthur': 'SWITZERLAND', 'daraa': 'Syria', 'balakhta': 'Russia', 'quezon': 'Philippines', 'borisoglebsk': 'Russia', 'wisbech': 'UNITED KINGDOM', 'bayou la batre': 'United States', 'beylikduzu': 'REPUBLIC OF TÜRKIYE', 'batyrevo': 'Russia', 'bolshoy uluy': 'Russia', 'yinkou': 'China', 'hodeida': 'Yemen', 'prior lake': 'United States', 'santo domingo': 'Dominican Republic', 'khan dari': 'Iraq', 'slavsk': 'RUSSIAN FEDERATION', 'yining city': 'CHINA', 'wickford': 'UNITED KINGDOM', 'al mayadin': 'Syria', 'kilwinning': 'UNITED KINGDOM', 'lusaka': 'Zambia', 'amissville': 'United States', 'suining': 'China', 'buynaksk': 'Russia', 'serov': 'Russia', 'doswell': 'United States', 'mahwah': 'United States', 'finksburg': 'United States', 'nevinnomyssk': 'Russia', 'llangollen': 'United Kingdom', 'barry': 'UNITED KINGDOM', 'sandown': 'UNITED KINGDOM', 'garbolovo': 'Russia', 'seongnam-si': 'South Korea', 'samsun': 'REPUBLIC OF TÜRKIYE', 'norcross': 'United States', 'vientiane': 'LAOS', 'beloozyorskiy': 'Russia', 'neya': 'Russia', 'artyom': 'Russia', 'mexicali': 'Mexico', 'leatherhead': 'UNITED KINGDOM', 'prince george': 'United States', 'huntington': 'United States', 'sylva': 'Russia', 'hyattsville': 'United States', 'khorfakkan': 'United Arab Emirates', 'bandar lampung': 'INDONESIA', 'leshan city': 'China', 'san salvador': 'El Salvador', 'egham': 'UNITED KINGDOM', 'nawa': 'Syria', 'gisenyi': 'Rwanda', 'talbot green': 'UNITED KINGDOM', 'gent': 'Belgium', 'norilsk': 'Russia', 'whitworth': 'United Kingdom', 'horgen': 'Switzerland', 'gabriel leyva solano': 'Mexico', 'cinderford': 'United Kingdom', 'elizovo': 'Russia', 'south sutton': 'United Kingdom', 'zigong city': 'China', 'paktia': 'Afghanistan', 'ekterinburg': 'Russia', 'cinncinati': 'United States', 'kizlyar': 'RUSSIAN FEDERATION', 'james store': 'United States', 'comilla': 'Bangladesh', 'north ferriby': 'UNITED KINGDOM', 'alhambra': 'United States', 'honolulu': 'United States', 'king william': 'United States', 'buchs': 'SWITZERLAND', 'shanghai city': 'China', 'welling': 'UNITED KINGDOM', 'baalbeck': 'Lebanon', 'raysal,': 'UNITED STATES OF AMERICA', 'sosnovka': 'Russia', 'gonbad kavoos': 'Iran', 'jiangyou': 'China', 'dorchester': 'UNITED KINGDOM', 'hertford': 'United Kingdom', 'i̇stanbul': 'TURKEY', 'emelyanovo': 'Russia', 'laohekou city': 'CHINA', 'khaborovsk': 'Russian Federation', 'port-saïd': 'Egypt', 'mansoura': 'Yemen', 'middlewich': 'UNITED KINGDOM', 'liversedge': 'UNITED KINGDOM', 'xuancheng': 'China', 'maputo': 'Mozambique', 'huanggang': 'China', 'gongyi': 'China', 'tokmok': 'Kyrgyzstan', 'leysin': 'SWITZERLAND', 'redmond': 'United States', 'kokdala': 'CHINA', 'island park': 'United States', 'changli county': 'China', 'beitun city': 'China', 'juba': 'South Sudan', 'south gate': 'United States', 'bandar nowshahr': 'IRAN', 'abergele': 'UNITED KINGDOM', 'zhongshan city': 'China', 'anatolia': 'TURKEY', 'winsford': 'UNITED KINGDOM', 'claremont': 'United States', 'foshan shi': 'China', 'vernier': 'Switzerland', 'donegal town': 'Ireland', 'harwich': 'UNITED KINGDOM', 'kuala lumpar': 'Malaysia', 'são josé de ribamar': 'Brazil', 'rostov on don': 'Russia', 'nuku’alofa': 'Tonga', 'bray': 'Ireland', 'wynyard': 'UNITED KINGDOM', 'chongqing cn': 'China', 'pavlovo': 'Russia', 'castleford': 'UNITED KINGDOM', 'sutton-in-ashfield': 'UNITED KINGDOM', 'marlton': 'United States', 'shengyang': 'China', 'marshall': 'United States', 'vyatskie polyany': 'Russia', 'calexico': 'United States', 'moreton-in-marsh': 'UNITED KINGDOM', 'swanage': 'United Kingdom', 'karlovy vary': 'Czech Republic', 'rochelle park': 'UNITED STATES', 'crediton': 'United Kingdom', 'albu kamal (al-bukamal)': 'SYRIA', "gu'an county": 'China', 'simeferopol': 'Ukraine', 'meizhou': 'China', 'mission': 'United States', 'shakhovskaya': 'Russia', 'brno': 'Czech Republic', 'tianshui': 'China', 'farah': 'Afghanistan', 'chimbote': 'Peru', 'baranovichi': 'BELARUS', 'ar riyadh': 'Saudi Arabia', 'xianshuigu city': 'China', 'perroy': 'SWITZERLAND', 'kalay myo': 'MYANMAR', 'banias': 'Syria', 'sandy': 'UNITED KINGDOM', 'hitchin': 'UNITED KINGDOM', 'roseville': 'United States', 'st helens': 'UNITED KINGDOM', 'neftekamsk': 'Russia', 'kalininets': 'Russia', 'vineland': 'United States', 'jingjiang': 'China', 'post falls': 'United States', 'oberwil bl': 'SWITZERLAND', 'sulu': 'PHILIPPINES', 'berezovka': 'Russia', 'le spring': 'United Kingdom', 'huntington beach': 'United States', 'alton': 'UNITED KINGDOM', 'jakarta barat': 'Indonesia', 'peterhead': 'United Kingdom', 'atushi city': 'China', 'independence': 'United States', 'shan state': 'Myanmar [Burma]', 'kington': 'United Kingdom', 'braintree': 'UNITED KINGDOM', 'diamond bar': 'UNITED STATES OF AMERICA', 'misurata': 'Libya', 'jocotenango': 'Guatemala', 'poplar bluff': 'United States', 'unecha': 'Russia', 'budapest': 'Hungary', 'sozopol': 'Bulgaria', 'moline': 'United States', 'belleville': 'United States', 'kasimov': 'Russia', 'burgaw': 'United States', 'poquoson': 'United States', 'pudsey': 'UNITED KINGDOM', "ji'an city": 'CHINA', 'zawiyah': 'Libya', 'pernik': 'Bulgaria', 'leidschendam': 'Netherlands', 'mt. jackson': 'United States', 'küsnacht': 'SWITZERLAND', 'putian': 'China', 'nabathieh': 'LEBANON', 'roseland': 'United States', 'banting': 'Malaysia', 'fries': 'United States', 'gurgaram': 'India', 'sanya': 'China', 'aldershot': 'UNITED KINGDOM', 'huyanghe': 'China', 'knox city': 'AUSTRALIA', 'petropavlovsk kamchatski': 'Russia', 'marion': 'United States', 'zalari': 'Russia', 'west melbourne': 'Australia', 'gaziantep': 'Turkey', 'eyup': 'Turkey', 'lugano': 'SWITZERLAND', 'taixing': 'China', 'bangor': 'UNITED KINGDOM', 'mannar': 'Sri Lanka', 'bria': 'Central African Republic', 'shoreham-by-sea': 'United Kingdom', 'polegate': 'UNITED KINGDOM', 'cotonou': 'Benin', 'osaka': 'Japan', 'sunrise': 'United States', 'seaford': 'United States', 'gimhae-si': 'South Korea', 'iloilo': 'PHILIPPINES', 'hampshire': 'United Kingdom', 'jincheng city': 'China', 'dasmarinas': 'PHILIPPINES', 'vaharai': 'SRI LANKA', 'chitre': 'PANAMA', 'maoming city': 'China', 'high point': 'United States', 'leeesburg': 'United States', 'zamboanga şehri': 'Philippines', 'los alamitos': 'United States', 'stone': 'UNITED KINGDOM', 'kuwait': 'Kuwait', 'dawlish': 'UNITED KINGDOM', 'dunn': 'United States', 'rendsburg': 'Germany', 'novo sarajevo': 'BOSNIA & HERZEGOVINA', 'jian': 'China', 'nashua': 'United States', 'longwood': 'UNITED KINGDOM', 'great sankey': 'UNITED KINGDOM', 'craven arms': 'UNITED KINGDOM', 'st. louis': 'United States', 'town tortola': 'British Virgin Island', 'holt': 'United States', 'mcclellanville': 'United States', 'oakland': 'United States', 'wa state': 'Myanmar [Burma]', 'midsomer norton': 'United Kingdom', 'ilkley': 'United Kingdom', 'chur': 'SWITZERLAND', 'holly springs': 'United States', 'burton-on-trent': 'UNITED KINGDOM', 'verkhnyaya salda': 'Russia', 'luan': 'China', 'roma': 'United States', 'thetford': 'UNITED KINGDOM', 'donggang city': 'China', 'tucson': 'United States', 'moskovsky': 'Russia', 'anteb': 'Turkey', 'south boston': 'United States', 'watertown': 'United States', 'walnut': 'United States', 'huangshan city': 'China', 'daventry': 'United Kingdom', 'dunkirk': 'United States', 'assaluyeh': 'Iran', 'angier': 'United States', 'yueqing': 'China', 'wan chai': 'China', 'rumyantsevo': 'Russia', 'alatyr': 'Russia', 'shirley': 'United States', 'pospelikha': 'Russia', 'bichelsee-balterwil': 'SWITZERLAND', 'jinjiang': 'China', 'jiaozhou city': 'CHINA', 'jalalabad city': 'Afghanistan', 'uyar': 'Russia', 'franklin': 'United States', 'yaounde': 'Cameroon', 'laizhou': 'China', 'gana sapele': 'Nigeria', 'kandahar şehri': 'Afghanistan', 'flagstaff': 'United States', 'trekhgornyi': 'Russia', 'havant': 'UNITED KINGDOM', 'enerhodar': 'Ukraine', 'shiyan': 'China', 'downham market': 'United Kingdom', 'hotan': 'China', 'artesia': 'United States', 'tahran': 'Iran', 'yining': 'China', 'changzhou city': 'China', 'zheleznogorsk ilimski': 'Russia', 'town taksimo': 'Russia', 'munster': 'United States', 'mountain view': 'United States', 'naro-fomins': 'Russia', 'bad homburg': 'Germany', 'herat': 'Afghanistan', 'noblesville': 'United States', 'blackstone': 'United States', 'san mateo': 'United States', 'simeropol': 'Ukraine', 'ahoskie': 'United States', 'godalming': 'UNITED KINGDOM', 'myersville': 'United States', 'bellingham': 'UNITED STATES OF AMERICA', 'provo': 'United States', 'milwaukee': 'United States', 'keketala city': 'China', 'kyrenia': 'Cyprus', 'ahwaz': 'Iran', 'caloocan city': 'Philippines', 'rason': 'NORTH KOREA', 'rock hill': 'United States', 'chernogolovka': 'Russia', 'noordwijk': 'Netherlands', 'thornton heath': 'UNITED KINGDOM', 'broomall': 'United States', 'garner': 'United States', 'withernsea': 'UNITED KINGDOM', 'aginskoe': 'Russia', 'huangchuan': 'China', 'kayseri': 'Turkey', 'thandwe city': 'Myanmar', 'pangasinan': 'PHILIPPINES', 'smorgon': 'Belarus', 'hertfordshire': 'United Kingdom', 'alfas del pi': 'Spain', 'frankfurt': 'Germany', 'zuzemberk': 'Slovenia', 'horley': 'UNITED KINGDOM', 'martinsburg': 'United States', 'rustavi': 'GEORGIA', 'nam dinh': 'Vietnam', 'stourport-on-severn': 'UNITED KINGDOM', 'swieqi': 'Malta', 'portage': 'United States', 'g staraya kupavna': 'RUSSIAN FEDERATION', 'etobicoke': 'Canada', 'landgraaf': 'NETHERLANDS', 'fremont': 'United States', 'garden city': 'UNITED KINGDOM', 'thandwe': 'Myanmar', 'svetly': 'Russia', 'el dorado': 'United States', 'brookfield': 'United States', 'laohekou': 'China', 'frankfurt am main': 'Germany', 'johnstone': 'UNITED KINGDOM', 'gulistan town': 'Uzbekistan', 'anseong-si': 'South Korea', 'shcherbinka': 'Russia', 'kokomo': 'United States', 'west wick': 'UNITED KINGDOM', 'haslingden': 'UNITED KINGDOM', 'neijiang': 'China', 'cherepovets': 'Russia', 'ebène': 'MAURITIUS', 'pasadena': 'United States', 'la puente': 'United States', 'minzag': 'Russia', 'bolivar': 'United States', 'gorny': 'Russia', 'putyatin': 'Russia', 'cheonan-si': 'South Korea', 'faversham': 'United Kingdom', 'johor bahru': 'Malaysia', 'clydebank': 'UNITED KINGDOM', 'baoji': 'China', 'nacogdoches': 'United States of America', 'delaplane': 'United States', 'kimry': 'RUSSIAN FEDERATION', 'bendery': 'Moldova', 'pleasanton': 'United States', 'ballymena': 'NORTHERN IRELAND (UNITED KINGDOM)', 'xuancheng city': 'China', 'bekasi utara': 'Indonesia', 'jincheng': 'China', 'almetyevsk': 'Russia', 'howell': 'UNITED STATES', 'vejile': 'Denmark', 'panjachel solola ca': 'GUATEMALA', 'new boston': 'United States', 'alanya antalya': 'TURKEY', 'suining city': 'China', 'le paquier-montbarry': 'Switzerland', 'palmetto': 'United States', 'munich': 'Germany', 'rasht gilan': 'Iran', 'deeside': 'UNITED KINGDOM', 'wilsonville': 'United States', 'newton': 'United States', 'santiago de': 'Chile', 'tappan': 'United States', 'wulanchabu': 'China', 'the hague': 'NETHERLANDS', 'kana': 'Lebanon', 'nizhni tagil': 'Russia', 'donaghadee': 'UNITED KINGDOM', 'suqian': 'China', 'adana': 'Turkey', 'qiqihar': 'China', 'king beirut': 'Lebanon', 'ekurhuleni': 'South Africa', 'yueyang city': 'CHINA', 'lomé': 'Togo', 'spassk-dalniy': 'Russia', 'long beach': 'United States', 'netanya': 'Israel', 'the woodlands': 'United States', 'cranbrook': 'United Kingdom', 'indio': 'United States', 'gachsaran': 'Iran', 'hillsville': 'United States', 'danbury': 'United States', 'truro': 'UNITED KINGDOM', 'yuhuan': 'China', 'torrance': 'United States', 'zalau': 'Romania', 'candelaria': 'VENEZUELA', 'myit kyi na': 'MYANMAR', 'wetherby': 'UNITED KINGDOM', 'mccomb': 'United States', 'biskra': 'Algeria', 'goode': 'United States', 'livingston': 'United Kingdom', 'hochiminh city': 'Vietnam', 'wake forest': 'United States', 'stanford le hope': 'United Kingdom', 'dongxiaokou': 'China', 'tal-shahpur': 'INDIA', 'rostov': 'Russia', 'kalyan': 'INDIA', 'selo alferovskoe': 'Russia', 'baykalovo': 'Russia', 'zabbar': 'Malta', 'rugeley': 'United Kingdom', 'kaifeng': 'China', 'selkirk': 'UNITED KINGDOM', 'basilan bölgesi': 'PHILIPPINES', 'ashby-de-la-zouch': 'UNITED KINGDOM', 'ozersk': 'Russia', 'sukhum': 'Georgia', 'scranton': 'United States', 'harrison township': 'United States', "yan'an": 'China', 'ampang': 'MALAYSIA', 'eskischir': 'Turkey', 'leningrad oblast': 'Russia', 'taiz': 'Yemen', 'gladys': 'United States', 'efahan': 'Iran', 'methil': 'UNITED KINGDOM', 'gun barrel city': 'United States of America', 'long island city': 'United States', 'granadilla': 'Spain', 'joliet': 'United States', 'beaufort west': 'South Africa', 'ventspils': 'Latvia', 'porthcawl': 'UNITED KINGDOM', 'symar': 'United States', 'clear brook': 'United States', 'wishaw': 'United Kingdom', 'st. austell': 'United Kingdom', 'defuniak springs': 'United States', 'southhampton': 'United States', 'noginsk': 'Russia', 'farifax': 'United States', 'shizuishan': 'China', 'linfen city': 'China', 'ghobeiri': 'Lebanon', 'wise': 'United States', 'blyth': 'UNITED KINGDOM', 'ossett': 'UNITED KINGDOM', 'saint paul': 'United States', 'sprinfield': 'United States', 'tarlac city': 'Philippines', 'inwood': 'United States', 'ciudad de': 'Guatemala', 'valley stream': 'United States', 'tibnin': 'LEBANON', 'petersfield': 'United Kingdom', 'lusby': 'United States', 'rome': 'Italy', 'kurdistan': 'Iran', 'satino-tatarskoe': 'Russia', 'qingyuan city': 'CHINA', 'wuxi shi': 'China', 'upper sandusky': 'United States', 'goldvein': 'United States', 'cullompton': 'UNITED KINGDOM', 'peoria': 'United States of America', 'sousse': 'TUNISIA', 'taungoo': 'Myanmar [Burma]', 'ha noi': 'Vietnam', 'flowood': 'United States', 'purfleet': 'UNITED KINGDOM', 'grimes': 'United States', 'sour tyre': 'Lebanon', 'talatona': 'Angola', 'nasr city': 'Egypt', 'kigali': 'Rwanda', 'kopeysk': 'RUSSIAN FEDERATION', 'arsenyev': 'Russia', 'abadan': 'Iran', 'bairnsdale': 'Australia', 'erskine': 'United Kingdom', 'phu ly city': 'Viet Nam', 'port of spain': 'Trinidad and Tobago', 'blountville': 'United States', 'zarinsk': 'Russia', 'santa clarita': 'United States', 'north potomac': 'United States', 'magnitogorsk': 'Russia', 'kstovo': 'Russia', 'panama': 'Panama', 'glen rose': 'United States', 'manzal tmim': 'TUNISIA', 'fulton': 'United States of America', 'swanley': 'United Kingdom', 'senezh': 'Russian Federation', 'shijiazhuang shi': 'CHINA', 'norwood': 'United States of America', 'wellington': 'UNITED KINGDOM', 'meridan': 'United States', 'jalalabad nangarhar': 'Afghanistan', 'braselton': 'United States', 'cuidad juarez': 'Mexico', 'somerset': 'United States', 'oum el-bouaghi': 'ALGERIA', 'balakovo': 'RUSSIAN FEDERATION', 'balakhna': 'RUSSIAN FEDERATION', 'huarez': 'Peru', 'bootle': 'UNITED KINGDOM', 'lyon': 'FRANCE', 'novaya lyalya': 'Russia', 'rizhao': 'China', 'paradiso': 'SWITZERLAND', 'grapevine': 'United States', 'zvecan': 'KOSOVO', 'mableton': 'United States', 'santa fe': 'United States', 'brockton,': 'United States', 'barmouth': 'United Kingdom', 'aral': 'China', "ta'izz city": 'Yemen', '南昌市': 'CHINA', 'batu': 'Indonesia', 'bexleyheath': 'United Kingdom', 'stockbridge': 'UNITED KINGDOM', 'hasanabad': 'IRAN', 'petrozavodsk': 'Russia', 'ellicott city': 'United States', 'los olivos': 'Peru', 'petropavlovsk': 'Kazakhstan', 'fort meyers': 'United States', 'yangzhou city': 'China', 'belokurikha': 'Russia', 'framlingham': 'United Kingdom', 'fort wayne': 'United States', 'waterford': 'United States', 'varna': 'Bulgaria', 'wallsend': 'UNITED KINGDOM', 'yazoo': 'United States', 'norco': 'United States', 'montero': 'Bolivia', 'novy urengoi': 'RUSSIAN FEDERATION', 'gosport': 'UNITED KINGDOM', 'shangha': 'CHINA', 'mulkilteo': 'United States', 'shangluo city': 'China', 'gonbad-e kavus': 'Iran', 'mawlamyine': 'Myanmar [Burma]', 'zhangjiajie': 'China', 'spassk-dalny': 'Russia', 'buntingford': 'UNITED KINGDOM', 'cramlington': 'UNITED KINGDOM', 'latakia': 'Syria', 'nogales': 'Mexico', 'chapala, jalisco 459': 'Mexico', 'moira': 'United Kingdom', 'naberezhnyye cheliny': 'Russia', 'sergiev posad-6': 'Russia', 'rostov na donu': 'Russia', 'renfrew': 'UNITED KINGDOM', 'yeshan': 'China', 'ordinary': 'United States', 'brussel': 'Belgium', 'kearneysville': 'United States', 'baalbak': 'Lebanon', 'quesnel bc': 'Canada', 'jiangmen': 'China', 'san martín': 'El Salvador', 'kab. bekasi barat': 'Indonesia', 'jiaozuo city': 'China', 'christiansted': 'UNITED STATES OF AMERICA', 'sliema': 'Malta', 'makhachkala': 'Russia', 'beşiktaş': 'REPUBLIC OF TÜRKIYE', 'san leandro': 'United States', 'burj el-barajineh': 'Lebanon', 'warrenton': 'United States', 'halifax': 'UNITED KINGDOM', 'stratford': 'United States', 'ussuriysk': 'Russia', 'shuanghe city': 'CHINA', 'uster': 'Switzerland', 'rowley': 'United States', 'clearwater': 'United States', 'kuzmichi': 'Russia', 'escondido': 'United States', 'wyandotte': 'United States', 'khorramshahr city': 'Iran', 'primorsk': 'Russia', 'spencer': 'United States', 'jinhua city': 'China', 'afonino': 'Russia', 'aberdare': 'UNITED KINGDOM', 'naypyitaw division': 'Myanmar', 'castlewellan': 'NORTHERN IRELAND (UNITED KINGDOM)', 'rubtsovsk': 'Russia', 'eigersund': 'Norway', 'donguan': 'China', 'chizhou city': 'China', 'verdun': 'Canada', 'rampur': 'India', 'cedar rapids': 'United States', 'billingham': 'UNITED KINGDOM', 'fermo': 'Italy', 'songnim': 'NORTH KOREA', 'mobile': 'UNITED STATES OF AMERICA', 'elkridge': 'United States', 'scott depot': 'United States', 'erith': 'UNITED KINGDOM', 'novyy urengoy': 'Russia', 'pinecrest': 'United States', 'thornridge city': 'United States', 'hobart': 'Australia', 'jinjiang city': 'China', 'bucks': 'United Kingdom', 'essex': 'United Kingdom', 'dayton': 'United States', 'piraeus': 'GREECE', 'bath': 'UNITED KINGDOM', 'la ciotat': 'Seychelles', 'hanover park': 'United States', 'dimashq': 'Syria', 'cradley heath': 'United Kingdom', 'eagle pass': 'United States', 'mitchells': 'United States', 'kab. temanggung': 'Indonesia', 'sunnyvale': 'United States', 'jizzakh': 'Uzbekistan', 'swedesboro': 'United States', 'tianxiajin': 'China', 'guangyuan': 'China', 'kota surakarta': 'Indonesia', 'shangrao': 'China', 'zaozhuang': 'China', 'meerut': 'India', 'yingtan city': 'CHINA', 'ouaka': 'CENTRAL AFRICAN REPUBLIC', 'quetta city': 'Pakistan', 'draper': 'United States', 'quetzaltenango': 'Guatemala', 'ferndown': 'UNITED KINGDOM', 'morecambe': 'UNITED KINGDOM', 'saint peterburg': 'Russia', 'enshi city': 'CHINA', 'vansant': 'United States', 'kirkcaldy': 'United Kingdom', 'brownhills': 'UNITED KINGDOM', 'hyde park': 'United States', 'bel air': 'United States', 'kokdala city': 'China', 'jenin': 'PALESTINE (WEST BANK-GAZA)', 'montpelier': 'United States', 'mayangone township': 'Myanmar', 'novocherkassk': 'Russia', 'cedar hill': 'United States', 'camden': 'United States', 'ustye': 'Belarus', 'oppens': 'Switzerland', 'ballynahinch': 'UNITED KINGDOM', 'novopolotsk': 'Belarus', 'corlu': 'Turkey', 'lubumbashi': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'kashan': 'Iran', 'ningguo': 'China', 'yafia': 'Yemen', 'appleby-in-westmorland': 'UNITED KINGDOM', 'bowling green': 'United States', 'sirinevler': 'Turkey', 'wrexham': 'UNITED KINGDOM', 'deland': 'United States', 'anhui': 'China', 'leighton buzzard': 'UNITED KINGDOM', 'galax': 'United States', 'winder': 'United States', 'zhuanghe city': 'China', 'bama town': 'CHINA', 'kota damansara': 'MALAYSIA', 'kashgar area': 'China', 'jbeil': 'Lebanon', 'thurso': 'United Kingdom', 'songlindian town': 'China', 'pardis': 'Iran', 'norman': 'United States', 'henley-in-arden': 'UNITED KINGDOM', 'waco': 'United States', 'herning': 'Denmark', 'tomolino': 'Russia', 'cheyenne': 'United States', 'shanwei': 'China', 'nabatiyeh': 'Lebanon', 'lambertville': 'United States', 'ojinaga': 'Mexico', 'ciudad sandino': 'Nicaragua', 'menoken': 'United States', 'new paltz': 'UNITED STATES OF AMERICA', 'majalengka kulon': 'Indonesia', 'bandar imam khomeini': 'Iran', 'ottawa lake': 'United States', 'starodub': 'Russia', 'dumbarton': 'UNITED KINGDOM', 'farmington': 'United States', 'bakersfield': 'United States', 'grodno': 'Belarus', 'abu ghurayb': 'IRAQ', 'cagayan de oro city': 'Philippines', 'shishou city': 'China', 'jacksonvillee': 'United States', 'mirfield': 'UNITED KINGDOM', 'würzburg': 'GERMANY', 'polyarnye zori': 'Russia', 'kaarina': 'Finland', 'chilhowie': 'United States', 'phû lý hà nam': 'Vietnam', 'marietta': 'United States', 'kingswinford': 'United Kingdom', 'tenali': 'INDIA', 'sittwe': 'Myanmar [Burma]', 'puchong': 'Malaysia', 'winfield': 'United States', 'west kirby': 'UNITED KINGDOM', 'erevan': 'Armenia', 'tijuana baja': 'Mexico', 'weymouth': 'United Kingdom', 'kaamius': 'China', 'osceola': 'United States', 'camilla': 'Bangladesh', 'ft lauderdale': 'United States', 'ust-kamenogorsk': 'Kazakhstan', 'winnipeg': 'CANADA', 'hammam-sousse': 'Tunisia', 'sarapul': 'Russian Federation', 'paramribo': 'SURINAME', 'totnes': 'United Kingdom', 'hughesville': 'United States', 'hampstead': 'United States', 'wichita': 'United States', 'shefford': 'United Kingdom', 'sandy hook': 'United States', 'al rastan': 'Syria', 'tripunithura': 'India', 'invergordon': 'United Kingdom', 'pontypool': 'UNITED KINGDOM', 'ciudad del este': 'Paraguay', 'gagarin': 'Russia', 'baalbek': 'Lebanon', 'iskitim': 'Russia', 'paignton': 'United Kingdom', 'northolt': 'UNITED KINGDOM', 'oceanside': 'United States', 'kushtia': 'Bangladesh', 'korablino': 'Russia', 'st. izhevsk': 'Russia', 'kunyu': 'China', 'cartersville': 'United States', 'docklands': 'Australia', 'sverdlovsk oblast': 'Russia', 'west covina': 'United States', 'bay st. louis': 'United States', 'zabul': 'Iran', 'sarozganj': 'Bangladesh', 'east hazelcrest': 'United States', 'e rochester': 'United States', 'wakaf bharu': 'Malaysia', 'carnforth': 'United Kingdom', 'little rock': 'United States', 'jdeidet el': 'Lebanon', 'greater manchester': 'United Kingdom', 'byfleet': 'United Kingdom', 'rexburg': 'United States', 'welwyn garden city': 'UNITED KINGDOM', 'crofton': 'United States', 'elabuga': 'Russian Federation', 'ghobairy': 'Lebanon', 'gryazi': 'Russia', 'jinbian city': 'China', 'jingzhou': 'China', 'lyngby': 'Denmark', 'lowestoft': 'UNITED KINGDOM', 'kano': 'Nigeria', 'vahdat city,': 'Tajikistan', 'kanchipuram': 'India', 'belper': 'United Kingdom', 'vereeniging': 'South Africa', 'rotterdam': 'Netherlands', 'chikaballpur': 'INDIA', 'farmville': 'United States', 'mitcham': 'United Kingdom', 'attard': 'Malta', 'lermontovo': 'Russia', 'lidsdale': 'Australia', 'ust-dzheguta': 'Russia', 'newington': 'UNITED STATES OF AMERICA', 'beni': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'chaozhou': 'China', 'kents store': 'United States', 'southfield': 'United States', 'st albans': 'UNITED KINGDOM', 'cebu city': 'PHILIPPINES', 'plainfield': 'United States', 'cavite': 'PHILIPPINES', 'kab. morowali': 'INDONESIA', 'denbigh': 'UNITED KINGDOM', 'ruislip': 'United Kingdom', 'protvino': 'Russia', 'qingzhou': 'China', 'boca chica': 'Dominican Republic', 'richlands': 'United States', 'new taipei city': 'Taiwan', 'brooksville': 'United States', 'rudnya': 'Russia', 'heusweiler': 'Germany', 'cancun': 'Mexico', 'wuzhou': 'China', 'paphos': 'Cyprus', 'najin': 'North Korea', 'longkou city': 'China', 'san gwann sgn': 'Malta', 'peshawar khyber pakhtunkhwa': 'Pakistan', 'janzour': 'LIBYA', 'kytmanovo': 'Russia', 'karaj city': 'Iran', 'knottingley': 'United Kingdom', 'guangshui city': 'China', 'jiangshan city': 'CHINA', 'miyaneh': 'Iran', 'lutterworth': 'UNITED KINGDOM', 'westport': 'United States', 'zhangjiakou city': 'China', 'lamman': 'AFGHANISTAN', 'bridgeport': 'United States', 'lawrenceville': 'United States', 'south okkalapa': 'Myanmar', 'fort pierce': 'United States', 'stowmarket': 'UNITED KINGDOM', 'shaoshan': 'China', 'khatlon province': 'TAJIKISTAN', 'broxbourne': 'UNITED KINGDOM', 'saltville': 'United States', 'fontana': 'United States', 'terrytown': 'United States', 'milano': 'Italy', 'shaanxi': 'China', 'hermosillo': 'Mexico', 'wednesbury': 'UNITED KINGDOM', 'spring hill': 'United States', 'carrickfergus': 'United Kingdom', 'dragør': 'Denmark', 'delray beach': 'UNITED STATES', 'ganzhou': 'China', 'changchun city': 'China', 'buckingham': 'United Kingdom', 'stalybridge': 'UNITED KINGDOM', 'bekasi': 'Indonesia', 'sidoarjo': 'Indonesia', 'ilminster': 'UNITED KINGDOM', 'gomersal': 'UNITED KINGDOM', 'otley': 'UNITED KINGDOM', 'kirkcudbright': 'UNITED KINGDOM', 'klin': 'Russia', 'sparks': 'United States', 'east moline': 'United States', 'gorodets': 'RUSSIAN FEDERATION', 'lennox': 'United States', 'murrieta': 'United States', 'bensenville': 'United States', 'west hollywood': 'United States', 'lilienthal': 'Germany', 'shantou shi': 'China', 'passaic': 'UNITED STATES OF AMERICA', 'yelabuga municipality': 'Russian Federation', 'mechanicsburg': 'United States of America', 'baoshan city': 'CHINA', 'meherrin': 'United States', 'vinh city': 'Viet Nam', 'city of st. petersburg': 'Russia', 'nizhniy tagil': 'Russia', 'bronx': 'United States', 'camuy': 'Puerto Rico', 'mataram': 'Indonesia', 'poulton-le-fylde': 'UNITED KINGDOM', 'khan-shaykhun': 'SYRIA', 'kalyazin': 'Russia', 'bloomington': 'United States', 'kosteryovo': 'Russia', 'east chicago': 'United States', 'lahej': 'Yemen', 'mirnyi': 'Russia', 'shahr-e kord': 'IRAN', 'redhill': 'UNITED KINGDOM', 'glendora': 'United States', 'alvarado': 'UNITED STATES OF AMERICA', 'asalouyeh': 'Iran', 'earley': 'UNITED KINGDOM', 'tainan': 'Taiwan', 'pulau pinang': 'Malaysia', 'pointe-à-la-croix quebec': 'Canada', 'guisborough': 'United Kingdom', 'cape coral': 'United States', 'gastonia': 'United States', 'erlangen': 'Germany', 'fushe kosove': 'Kosovo', 'dursley': 'UNITED KINGDOM', 'north conway': 'United States', 'sarakhs': 'IRAN', 'blue springs': 'United States', 'bonita springs': 'United States', 'south windsor': 'United States', 'oak ridge': 'United States', 'agrate brianza': 'Italy', 'trablus': 'Libya', 'mitrovice': 'KOSOVO', 'tuen mun': 'China', 'rosemont': 'UNITED STATES', 'bien hoa': 'Vietnam', 'limsassol': 'Cyprus', 'lakki marwat': 'Pakistan', 'newtown': 'United States', 'holmfirth': 'UNITED KINGDOM', 'evesham': 'United Kingdom', 'daugavpils': 'Latvia', 'south ogden': 'United States', 'pully': 'Switzerland', 'hoboken': 'United States', 'tuckasegee': 'United States', 'juarez': 'Mexico', 'eilat': 'ISRAEL', 'dujiangyan': 'China', 'hpa-an': 'Myanmar', 'palma de mallorca': 'Spain', 'algete': 'Spain', 'chapaevsk': 'Russia', 'shiojiri': 'Japan', 'natchez': 'United States', 'angarsk': 'Russia', 'al-bukama': 'Syria', 'rialto': 'United States', 'katyr-yurt': 'RUSSIAN FEDERATION', 'ningbo shi': 'China', 'pondicherry': 'India', 'mahabubnagar': 'India', 'easton': 'United States', 'crosby': 'United States', 'bradenton': 'United States', 'nyaung u': 'MYANMAR', 'raffles place': 'Singapore', 'brest': 'Belarus', 'shchyolkovo': 'Russia', 'ayeyarwady': 'Myanmar [Burma]', 'celje': 'Slovenia', 'boroko': 'PAPUA NEW GUINEA', 'zavidovici': 'Bosnia and Herzegovina', 'municipio: luanda': 'Angola', 'pochep': 'Russia', 'kaltan': 'Russia', 'bogota dc': 'Colombia', 'north york': 'Canada', 'batak': 'Russia', 'cowbridge': 'UNITED KINGDOM', 'port gibson': 'United States', 'xichang': 'China', 'temple hills': 'United States', 'pingquan city': 'China', 'nalchik': 'Russia', 'saint-quentin': 'France', 'bethlehem': 'PALESTINE (WEST BANK-GAZA)', 'zhoukou city': 'China', 'asheville': 'United States', 'nizhegorodskaya': 'Russia', 'salavat': 'Russia', 'norrköping': 'Sweden', 'inverness': 'United States', 'southminster': 'UNITED KINGDOM', 'pendleton': 'United States', 'irbil': 'Iraq', 'helensburgh': 'UNITED KINGDOM', 'hurricane': 'United States', 'gao’an city': 'CHINA', 'banbury': 'UNITED KINGDOM', 'irbeyskoe': 'Russia', 'mullaitivu': 'SRI LANKA', 'doma': 'Syria', 'xinzhou': 'China', 'subotica': 'Serbia', 'macomb': 'United States', 'parma': 'Italy', 'letchworth garden city': 'United Kingdom', 'al-rawah': 'IRAQ', 'piscataway': 'United States', 'chapeavsk': 'RUSSIAN FEDERATION', 'emporia': 'United States', "mevo'ot yericho": 'PALESTINE (WEST BANK-GAZA)', 'lynnwood': 'United States', 'fareham': 'UNITED KINGDOM', 'jiuquan city': 'CHINA', 'newnan': 'United States', 'energodar': 'UKRAINE', 'shuangyashan': 'China', 'costa mesa': 'United States', 'merseyside': 'UNITED KINGDOM', 'louisa': 'United States', 'wevelgem': 'BELGIUM', 'buckhurst hill': 'UNITED KINGDOM', 'mountain lakes': 'UNITED STATES OF AMERICA', 'safety harbor': 'United States', 'ashington': 'UNITED KINGDOM', 'wanchai': 'Hong Kong', 'heathfield': 'UNITED KINGDOM', 'yogyakarta': 'Indonesia', 'kerman': 'Iran', 'hallandale': 'United States', 'haywards heath': 'UNITED KINGDOM', 'romeoville': 'United States', 'henley-on-thames': 'UNITED KINGDOM', 'bobruysk': 'Belarus', 'cusago': 'Italy', 'fengyi town': 'CHINA', 'windson': 'United States', 'pamulang': 'Indonesia', 'samborondón': 'Ecuador', 'new  york': 'UNITED STATES', 'strada provinciale vejanese snc': 'Italy', 'westby': 'UNITED STATES OF AMERICA', 'new tredegar': 'UNITED KINGDOM', 'newburyport': 'United States', 'ramsgate': 'UNITED KINGDOM', 'compton': 'United States', 'batticaloa': 'Sri Lanka', 'luzern': 'SWITZERLAND', 'xinjiang uighur autonomous region': 'China', 'muyenga': 'Uganda', 'marlbourough': 'United States', 'prestatyn': 'UNITED KINGDOM', 'bordon': 'UNITED KINGDOM', 'long branch': 'United States', 'yazoo city': 'United States', 'locke haven': 'United States', 'rochester hills': 'United States', 'huzhou shi': 'China', 'fontvieille': 'Monaco', 'dmitrov': 'Russia', 'i̇slamabad': 'Pakistan', 'faith': 'Turkey', 'isilkul': 'Russia', 'ranchos palos verdes': 'United States', 'lodzki': 'POLAND', 'manhattan': 'United States', 'jinzhou shi': 'China', 'le port': 'France', 'solnechnogorsk': 'Russia', 'neryungri': 'Russia', 'nijmegen': 'Netherlands', 'stephens city': 'United States', 'unionville ontario': 'Canada', 'sisters': 'United States', 'resron': 'United States', 'ghazieh': 'Lebanon', 'delfzij': 'NETHERLANDS', 'varamin': 'Iran', 'dobbs ferry': 'United States', 'south jakarta': 'Indonesia', 'menindee': 'AUSTRALIA', 'tongren': 'China', 'shchomyslitsky': 'BELARUS', 'manjusar': 'India', 'bayonne': 'UNITED STATES', 'honiara': 'SOLOMON ISLANDS', 'haverhill': 'UNITED KINGDOM', 'tramvainy': 'Russia', 'great oakley': 'UNITED KINGDOM', 'stankovo': 'Belarus', 'chifeng': 'China', 'chiang rai': 'Thailand', 'mandaue city': 'PHILIPPINES', 'tallmadge': 'United States', 'glenrothes': 'UNITED KINGDOM', 'chongzhou': 'China', 'goa velha': 'INDIA', 'mishawaka': 'United States', 'jupiter': 'United States', 'syktyvkar': 'Russia', 'geroevskoe': 'Ukraine', 'rapid city': 'United States', 'krong bavet': 'Cambodia', 'al bukamal': 'SYRIA', 'weyers cave': 'United States', 'banbridge': 'UNITED KINGDOM', 'mutsamudu': 'Comoros', 'bedale': 'United Kingdom', 'watsonville': 'United States', 'nizhnekamsk': 'Russia', 'meshcherino': 'Russia', 'jerusalem': 'Israel', 'morelia': 'Mexico', 'zhongxiang city': 'CHINA', 'hale': 'UNITED KINGDOM', 'south riding': 'United States', 'sankt-peterburg': 'Russia', 'hanford': 'United States', 'labinsk': 'Russia', 'oakwood': 'United States', 'formby': 'United Kingdom', 'hong linh': 'Vietnam', 'mound bayou': 'United States', 'chertsey': 'UNITED KINGDOM', 'inverurie': 'United Kingdom', 'sichuan': 'China', 'pulborough': 'UNITED KINGDOM', 'gus-khristalny': 'Russian Federation', 'val d’oise': 'France', 'longnan': 'China', 'abu dhabi': 'United Arab Emirates', 'woodland hills': 'United States', 'harare': 'Zimbabwe', 'agoura hills': 'United States', 'mesa': 'United States', 'nowshera': 'PAKISTAN', 'panabo davao city': 'Philippines', 'hasbrouck heights': 'United States', 'putian city': 'China', 'qiqihar city': 'China', 'kirkby-in-ashfield': 'UNITED KINGDOM', 'yong peng': 'Malaysia', 'wath-upon-dearne': 'UNITED KINGDOM', 'tsivilsk': 'Russia', 'basaksehir': 'Turkey', 'shaaf al-sourani': 'Palestinian Territories', 'dengzhou': 'CHINA', 'biggar': 'UNITED KINGDOM', 'arcata': 'United States', 'opfikon': 'SWITZERLAND', 'colorado': 'UNITED STATES', 'patuakhali': 'BANGLADESH', 'carrickmacross': 'UNITED KINGDOM', 'crumlin': 'United Kingdom', 'dalkeith': 'UNITED KINGDOM', 'viby j.': 'Denmark', 'deir qanoun en nahr': 'Lebanon', 'kuche city': 'China', 'knaresborough': 'UNITED KINGDOM', 'sanborondón': 'Ecuador', 'omagh': 'NORTHERN IRELAND (UNITED KINGDOM)', 'eslamshahr': 'Iran', 'natick': 'United States', 'davao city': 'Philippines', "musa qal'ah": 'Afghanistan', 'stateline': 'United States', 'cowes': 'UNITED KINGDOM', 'hebi': 'China', 'gegu town': 'China', 'sin el fil': 'Lebanon', 'otradnoe': 'Russia', 'pyongyang,': "Democratic People's Republic of Korea", 'lucedale': 'United States', 'stokesley': 'UNITED KINGDOM', 'khabarovsk district': 'Russia', 'seversk': 'Russia', 'gaza strip': 'PALESTINE (WEST BANK-GAZA)', 'colwyn bay': 'UNITED KINGDOM', 'gdansk': 'POLAND', 'berkshire': 'United Kingdom', 'la habra': 'United States', 'lindsay': 'UNITED STATES OF AMERICA', 'windermere': 'UNITED KINGDOM', 'hengyang city': 'China', 'lydney': 'UNITED KINGDOM', 'dobryanka': 'Russia', 'rabochiy posyolok svobodny': 'Russia', 'obiliq': 'Kosovo', 'buffalo grove': 'United States', 'voskresensk': 'Russia', 'north andover': 'United States', 'banda aceh': 'Indonesia', 'nanaimo': 'Canada', 'so holland': 'United States', 'north arlington': 'UNITED STATES', 'sansha': 'China', 'summit': 'United States', 'xian shi': 'China', 'al-mukalla': 'Yemen', 'strathaven': 'UNITED KINGDOM', 'hu uaraz': 'Peru', 'bundall': 'Australia', 'belovo': 'Russia', 'ammanford': 'UNITED KINGDOM', 'statesville': 'United States', 'yuyao': 'CHINA', 'atlantis': 'United States of America', 'raeford': 'United States', 'novouralsk': 'Russia', 'beavercreek': 'United States', 'east troy': 'United States', 'saint-sulpice': 'SWITZERLAND', 'pingdingshan city': 'China', 'church hill': 'United States', 'kashgar city': 'China', 'saint louis': 'United States', 'mumbi': 'INDIA', 'zhuanghe': 'China', 'city of edinburgh': 'United Kingdom', 'sumatera utara': 'Indonesia', 'tumushuk': 'CHINA', 'port hueneme': 'United States', 'musul': 'IRAQ', 'bissen': 'Luxembourg', 'mohdpur': 'India', 'changji': 'China', 'curitiba': 'BRAZIL', 'kozelsk': 'Russia', 'penarth': 'UNITED KINGDOM', 'rocky hill': 'United States', 'sayun': 'Yemen', 'forestville': 'United States', 'westlake': 'United States', 'ripon': 'UNITED KINGDOM', 'pekalongan': 'Indonesia', 'huaibei': 'CHINA', 'hinthada': 'Myanmar [Burma]', 'bogotá': 'Colombia', 'moreno valley': 'United States', 'stanford-le-hope': 'United Kingdom', 'wanzhong city': 'China', 'liskeard': 'UNITED KINGDOM', 'molodechno': 'Belarus', 'south lebanon': 'UNITED STATES OF AMERICA', 'republic of tatarstan': 'Russian Federation', 'sarai': 'Russia', 'spennymoor': 'UNITED KINGDOM', 'kotlas': 'Russia', 'yingtan': 'China', 'baar': 'SWITZERLAND', 'hardy': 'United States', 'shouguang': 'CHINA', 'kirchheim': 'GERMANY', 'ballina': 'Australia', 'frodsham': 'UNITED KINGDOM', 'assalouyeh': 'Iran', 'vologda 20': 'Russia', 'bhiwadi': 'India', 'shadogou town': 'China', 'coralville': 'United States', 'webberville': 'United States', 'novgorod': 'RUSSIA', 'elets': 'Russia', 'jamestown': 'United States', 'slavgorod': 'Russia', 'kota': 'INDIA', 'cumberland': 'United States', 'leven': 'UNITED KINGDOM', 'volodarskiy district': 'Russia', 'stillwater': 'UNITED STATES OF AMERICA', 'orlovka': 'Russia', 'cheadle': 'United Kingdom', 'bole city': 'China', 'shwepyitha township': 'Myanmar [Burma]', 'goshen': 'United States', 'exmouth': 'UNITED KINGDOM', 'newport beach': 'United States', 'kestel': 'REPUBLIC OF TÜRKIYE', 'fitchburg': 'United States', 'lviv city': 'Ukraine', 'penrith': 'UNITED KINGDOM', 'kaitun': 'China', 'brookhaven': 'United States', 'palm city': 'United States', 'kingisepp': 'RUSSIAN FEDERATION', 'chaoyang': 'China', 'vallscreek': 'United States', 'epping': 'UNITED KINGDOM', 'caibarién': 'Cuba', 'hlaing township': 'Myanmar', 'george': 'South Africa', 'broadstairs': 'UNITED KINGDOM', 'petra-dubrava': 'Russia', 'pleasant prairie': 'United States', 'carthage': 'TUNISIA', 'priozersk': 'Kazakhstan', 'peterstown': 'United States', 'ringwood': 'UNITED KINGDOM', 'sana’a': 'Yemen', 'grafton': 'United States', 'windsor locks': 'United States', 'haret hreik': 'Lebanon', 'miami gardens': 'United States', 'elmira': 'United States', 'inner mongolia': 'China', 'xinyang': 'China', 'eysk': 'Russia', 'malang': 'Indonesia', 'jilib': 'Somalia', 'bohemia': 'United States', 'caldogno': 'Italy', 'vicksburg': 'United States', 'chon buri': 'THAILAND', 'pré saint gervais': 'FRANCE', 'chihuahua city': 'Mexico', 'yeonsu-gu': 'South Korea', 'chongzuo city': 'China', 'tall afar': 'Iraq', 'norrkoping': 'Sweden', 'linden': 'United States', "st george's": 'GRENADA', 'khan younis': 'Palestine', 'hoddesdon': 'UNITED KINGDOM', 'picayune': 'United States', 'hudson': 'United States', 'the valley': 'Anguilla', 'newton abbot': 'UNITED KINGDOM', 'minato-ku': 'Japan', 'tuapse': 'Russia', 'chula vista': 'United States', 'subang jawa barat': 'Indonesia', 'pune city': 'INDIA', 'gretna': 'United States', 'cainta': 'Philippines', 'richardson': 'United States', 'dexing city': 'China', 'tustin': 'United States', 'lytham st annes': 'United Kingdom', 'beverly hills': 'United States', 'dzerzhinsk city': 'RUSSIAN FEDERATION', "o'fallon": 'United States', 'elista': 'Russia', 'karatay': 'Turkey', 'ciudad obregon': 'Mexico', 'russell springs': 'United States', 'nizhny arkhyz': 'Russia', 'liaoyang': 'China', 'huaying': 'China', 'summerland': 'Canada', 'spring grove': 'United States', 'valletta': 'Malta', 'chapel hill': 'United States', 'kab. tegal': 'INDONESIA', 's. bras de alportel': 'Poland', 'verkhnyaya tura': 'Russia', 'saisai city': 'Mozambique', 'priluki': 'BELARUS', 'four oaks': 'United States', 'lesage': 'United States', 'slymar': 'United States', 'datong': 'China', 'santa rosa': 'United States', 'coquitlam': 'CANADA', 'houghton regis': 'United Kingdom', 'corydon': 'United States', 'scarborough': 'United Kingdom', "nuku'alofa": 'Tonga', 'calgary': 'Canada', 'mǭnchen': 'Germany', 'wenzhou': 'China', 'lishui': 'China', 'northallerton': 'UNITED KINGDOM', 'whittlesey': 'United Kingdom', 'port-au\xadprince': 'HAITI', 'eastleigh': 'UNITED KINGDOM', 'tulun': 'Russia', 'sharm el-sheikh': 'Egypt', 'aleksandrov': 'Russia', 'danvers': 'United States', 'melfa': 'United States', 'shterpce': 'KOSOVO', 'bahcelievler': 'Turkey', 'binzhou city': 'China', 'jinzhong city': 'China', 'st. george': 'United States of America', 'moore': 'United States', 'bronderslev': 'DENMARK', 'gwalior': 'India', 'sanborn': 'United States', 'north wildwood': 'United States', 'anadyr': 'Russia', 'faridabad': 'India', 'syerling': 'United States', 'riddes': 'SWITZERLAND', 'jefferesonville': 'United States', 'lupfig': 'SWITZERLAND', 'ryazhsk': 'Russia', 'ilkadim': 'REPUBLIC OF TÜRKIYE', 'qinhan new city': 'China', 'kuala kangsar': 'Malaysia', 'tskhinvali': 'Georgia', 'hincesti': 'Moldova', 'laugharne': 'United Kingdom', 'ixtlan de rio': 'Mexico', 'kakchatsy': 'China', 'islamabad urban': 'Pakistan', 'qinzhou': 'China', 'south prince george': 'United States', 'vilyuchinsk': 'Russia', 'putevka': 'Russia', 'ebbw vale': 'UNITED KINGDOM', 'coral springs': 'United States', 'dronfield': 'UNITED KINGDOM', 'erlanger': 'UNITED STATES OF AMERICA', 'tumxuk': 'China', 'biggleswade': 'United Kingdom', 'tumshuq city': 'China', 'bungay': 'UNITED KINGDOM', 'chonburi': 'Thailand', 'oglinzi': 'Romania', 'columbia city': 'United States', 'schererville': 'United States', 'amran': 'Yemen', 'brielle': 'United States', 'little hulton': 'UNITED KINGDOM', 'jingmen': 'China', 'guangshui': 'China', 'taytay': 'Philippines', 'nanfaxin town': 'China', 'sheung wan': 'Hong Kong', 'siedlce': 'Poland', 'carterton': 'UNITED KINGDOM', 'belcamp': 'United States', 'yidu': 'CHINA', 'ishimbai': 'Russia', 'yadkinville': 'United States', 'akhty': 'Russia', 'faisalabad': 'PAKISTAN', 'qu xiamen': 'China', 'western cape': 'South Africa', 'mula': 'Turkey', 'jiaozuo': 'China', 'converse': 'UNITED STATES', 'davenport': 'United States', 'whitstable': 'UNITED KINGDOM', 'pterozavodsk': 'Russia', 'lichfield': 'UNITED KINGDOM', 'rembau': 'Malaysia', 'kungalv': 'Sweden', 'uccle': 'Belgium', 'pushkino': 'Russia', 'east hartford': 'United States', 'delta': 'Canada', 'sherwood': 'United States', 'novato': 'United States', 'yenisehir': 'Turkey', 'salt lake city': 'United States', 'stolichna': 'Bulgaria', 'mira loma': 'United States', 'jaipur': 'India', 'kambarka': 'Russia', 'bogoroditsk': 'Russia', 'kawloon': 'CHINA', 'jingdezhen city': 'China', 'bukit antarabangsa': 'MALAYSIA', 'gongqingcheng': 'China', 'siping': 'China', 'roshchino': 'RUSSIA', 'corning': 'United States', 'vungtau': 'VIETNAM', 'luohe city': 'China', 'livny': 'Russian Federation', 'bobruisk': 'Belarus', 'shimsk': 'Russia', 'sandston': 'United States', 'bugulma': 'Russia', 'forfar': 'United Kingdom', 'yuzhno sukhokumsk': 'RUSSIA', 'novozybkov': 'Russia', 'pfäffikon': 'SWITZERLAND', 'kinder': 'United States', 'dombivali': 'India', 'duffryn': 'United Kingdom', 'carache': 'VENEZUELA', 'witham': 'UNITED KINGDOM', 'queen creek': 'United States', 'keyport': 'United States', 'dalbeattie': 'United Kingdom', 'batesville': 'United States', 'jarkarta': 'Indonesia', 'yangin': 'MYANMAR', 'lochgelly': 'United Kingdom', 'brownsburg': 'United States', 'komsomolskon-amur': 'RUSSIAN FEDERATION', 'pearisburg': 'United States', 'zhijiang': 'China', 'laneview': 'United States', 'mecico city': 'Mexico', 'bandar assalouyeh': 'IRAN', 'sarnia': 'CANADA', 'tsiolkovski': 'RUSSIA', 'buuckeye': 'UNITED STATES', 'city phnom penh': 'Cambodia', 'tanintharyi': 'Myanmar [Burma]', 'kenbridge': 'United States', 'nizhny novgorod city': 'RUSSIAN FEDERATION', 'ellon': 'UNITED KINGDOM', 'hub': 'Pakistan', 'indore': 'India', 'cherkasy': 'Ukraine', 'kuitun city': 'China', 'toulouse': 'France', 'weirton': 'United States', 'dragor': 'Denmark', 'mantin': 'Malaysia', 'waldorf': 'United States', 'oberuzwil': 'Switzerland', 'minusinsk': 'Russia', 'inje-gun': 'South Korea', 'seaham': 'UNITED KINGDOM', 'anyang city': 'China', 'bethel park': 'United States', 'kgs. lyngby': 'Denmark', "da'an city": 'China', 'sehitkamil': 'Turkey', 'kiashahr': 'Iran', 'kadikoy': 'Turkey', 'totton': 'United Kingdom', 'hama': 'Syria', 'kingsport': 'United States', "king's lynn": 'United Kingdom', 'lenzburg': 'SWITZERLAND', 'makati': 'Philippines', 'xinzheng': 'China', 'grand island': 'United States', 'kahuta': 'Pakistan', 'al qasser': 'Syria', 'tabriz': 'Iran', 'subang jaya': 'Malaysia', 'poti': 'Georgia', 'woodstock': 'United States', 'great harwood': 'UNITED KINGDOM', 'collins': 'United States', 'ili': 'China', 'vyshny volochyok': 'Russia', 'taijiang': 'CHINA', 'labuan': 'Malaysia', 'astana city': 'Kazakhstan', 'daharki': 'Pakistan', 'subang': 'Indonesia', 'royton': 'UNITED KINGDOM', 'whitacre': 'United States', 'baltiysk': 'Russia', 'yulin city': 'China', 'hamhung south': 'NORTH KOREA', 'lishui city': 'China', 'depok city': 'Indonesia', 'churchville': 'United States', 'clevedon': 'United Kingdom', 'grenchen': 'SWITZERLAND', 'sandwich': 'United Kingdom', 'woerden': 'Netherlands', 'gorod novosibirsk': 'Russia', 'charles city': 'United States', 'mossbank': 'United Kingdom', 'little egg harbor': 'United States', 'yasnaya polyana': 'Russia', 'tehsil rinala khurd': 'Pakistan', 'osio sotto': 'Italy', 'sabratha': 'Libya', 'chadderton': 'UNITED KINGDOM', 'novi banovci': 'Serbia', 'muratpasa': 'REPUBLIC OF TÜRKIYE', 'rosedale': 'United States', 'bojnord city': 'IRAN', 'walton on the naze': 'UNITED KINGDOM', 'shlisselburg': 'Russia', 'meikthila': 'Myanmar', 'myrtle bank': 'Australia', 'tainan city': 'Taiwan', 'jarabacoa': 'Dominican Republic', 'kendallville': 'United States', 'kayapinar': 'REPUBLIC OF TÜRKIYE', 'sejong': 'South Korea', 'alexandrie': 'Egypt', 'gyeongsangbuk-do': 'South Korea', 'yiwu city': 'China', 'hilton head island': 'United States', 'dangyang': 'China', 'los fresnos': 'United States', 'arbil': 'Iraq', 'hodeidah': 'Yemen', 'mbaïki': 'CENTRAL AFRICAN REPUBLIC', 'astoria': 'United States', 'shizuishan city': 'China', 'troutville': 'United States', 'chaah': 'Malaysia', 'ronkonkoma': 'United States', 'sorocaba': 'Brazil', 'las vagas': 'United States of America', 'zhangshu city': 'China', 'north yarmouth': 'United States', 'petaluma': 'United States', 'rimonim': 'PALESTINE (WEST BANK-GAZA)', 'radford': 'United States', 'pontypridd': 'UNITED KINGDOM', 'tatarstan': 'Russia', 'te awamutu': 'NEW ZEALAND', 'quantico': 'United States', 'linfen': 'China', 'swadlincote': 'United Kingdom', 'gongzhuling': 'China', 'new canaan': 'United States of America', 'asbest': 'Russia', 'suweida': 'Syria', 'guamuchil': 'Mexico', 'westbury': 'United Kingdom', 'worchester': 'UNITED KINGDOM', 'zhongjiazhuang': 'China', "sa'dah": 'Yemen', 'pennington gap': 'United States', 'california': 'United States of America', 'victoria mahe': 'Seychelles', 'palm harbor': 'UNITED STATES OF AMERICA', 'moscos': 'Russia', 'farmingdale': 'United States', 'fribourg': 'Switzerland', 'crissier': 'SWITZERLAND', 'xingtai': 'China', 'cavan': 'IRELAND', 'warner robins': 'United States', 'longhai': 'China', 'pune': 'India', 'woodward': 'United States of America', 'khomeini shahr city': 'IRAN', 'cypress': 'United States', 'derzhinsk': 'RUSSIAN FEDERATION', 'cottonwood': 'United States', 'uithoorn': 'NETHERLANDS', 'manta': 'Ecuador', 'labis': 'Malaysia', 'huaihua': 'China', 'ivor': 'United States', 'mount airy': 'United States', 'hood': 'United States', 'unterägeri': 'Switzerland', 'raysal': 'United States', 'new brighton': 'United States', 'cham city': 'Vietnam', 'richmnd': 'United States', 'caloocan': 'Philippines', 'idleb': 'Syria', 'oreshkovichi': 'Belarus', 'jinchang': 'China', 'north little rock': 'United States', 'city of barnaul': 'RUSSIAN FEDERATION', 'kish island': 'Iran', 'aaley': 'Lebanon', 'utrecht': 'Netherlands', 'qufu': 'China', 'ellijay': 'United States', 'manakin sabot': 'United States', 'kota tegal': 'Indonesia', 'luhansk city': 'RUSSIA', 'zhaodong city': 'China', 'cockeysville': 'United States', 'kwun tong': 'Hong Kong', 'shifnal': 'United Kingdom', 'herbertsdale': 'South Africa', 'bandar imam khomeini city': 'Iran', 'xuzhou city': 'China', 'lawrenceburg': 'United States', 'edmonton': 'Canada', 'stanley': 'United States', 'niagara falls': 'United States', 'topton': 'United States', 'biysk': 'Russia', 'sun valley': 'United States', 'honghu city': 'CHINA', 'nakhabino': 'Russia', 'al-fallujah': 'IRAQ', 'skelleftea': 'Sweden', 'cinnaminson': 'UNITED STATES', 'oologah': 'United States', 'fokino': 'Russia', 'panjin': 'China', 'north hollywood': 'United States', 'catacamas': 'Honduras', 'trumbull': 'United States', 'orekhovo - zuyevo': 'RUSSIA', 'zhukovka': 'Russia', 'chia': 'Colombia', 'north wilkesboro': 'United States', 'regensdorf': 'SWITZERLAND', 'clearwater beach': 'United States', 'stroud': 'UNITED KINGDOM', 'dillwyn': 'United States', 'taizhou shi': 'China', 'luga': 'Russia', 'binhai': 'China', 'bolbasovo town': 'Belarus', 'merthyr tydfil': 'United Kingdom', 'clitheroe': 'UNITED KINGDOM', 'amissvile': 'United States', 'poschiavo': 'SWITZERLAND', 'hudaydah': 'Yemen', 'boaz': 'United States', 'caburde': 'Venezuela', 'schereville': 'United States', 'changde': 'China', 'camborne': 'United Kingdom', 'xezhou': 'China', 'woddbridge': 'United States', 'harpenden': 'UNITED KINGDOM', 'north hills': 'United States', 'mt. airy': 'United States', 'sankt petersborg': 'RUSSIAN FEDERATION', 'flint': 'United Kingdom', 'huyton': 'United Kingdom', 'ilawa': 'POLAND', 'istra': 'Russia', 'kachkanar': 'Russia', 'cagayan de oro': 'PHILIPPINES', 'liaocheng city': 'China', 'st.newark': 'United States', 'songyuan': 'China', 'eagan': 'United States', 'al farwaniyah': 'Kuwait', 'yorba linda': 'United States of America', 'limavady': 'United Kingdom', 'postavy': 'Belarus', 'delmar': 'United States', 'smyrna': 'United States', 'wängi': 'SWITZERLAND', 'st john': 'CANADA', 'oak lawn': 'UNITED STATES OF AMERICA', 'baijiaping': 'China', 'kletsk': 'Belarus', 'gölba': 'Turkey', 'newbridge': 'Ireland', 'cirencester': 'UNITED KINGDOM', 'ulaabaatar': 'Mongolia', 'rockland': 'United States', 'whitehaven': 'United Kingdom', 'hackensack': 'United States', 'seabrook': 'United States', 'grand ledge': 'United States', 'salta': 'Argentina', 'dorking': 'UNITED KINGDOM', 'jiaxing shi': 'China', 'baihou town': 'China', 'royston': 'United Kingdom', 'holsworthy': 'United Kingdom', 'nizhnie sergi': 'Russia', 'korla city': 'China', 'ravenel': 'United States', 'watauga': 'UNITED STATES OF AMERICA', 'cotabato': 'PHILIPPINES', 'bennet': 'United States', 'llanelli': 'UNITED KINGDOM', 'wen zhou': 'China', 'fayetteville': 'United States', 'senatobia': 'United States', 'rockbridge baths': 'United States', 'zhukovskii': 'Russia', 'shkotovo': 'Russia', 'pueblo': 'United States', 'ibstock': 'UNITED KINGDOM', 'muncie': 'United States', 'gainsborough': 'UNITED KINGDOM', 'hexham': 'United Kingdom', 'bridlington': 'UNITED KINGDOM', 'terskol': 'Russia', 'rakhine': 'Myanmar [Burma]', 'qazvin': 'Iran', 'aprelevka': 'Russia', 'sacatepequez': 'Guatemala', 'elmali mah': 'REPUBLIC OF TÜRKIYE', 'liberty': 'UNITED STATES OF AMERICA', 'clinceni': 'Romania', 'brasov': 'Romania', 'saskatoon': 'Canada', 'methuen': 'United States', 'cooper city': 'United States', 'lucerne': 'Switzerland', 'newent': 'UNITED KINGDOM', 'ajeltake island': 'MARSHALL ISLANDS', 'fornebu': 'Norway', 'pensacola': 'United States', 'glenpool': 'UNITED STATES OF AMERICA', 'middlefield': 'United States', 'suizhou city': 'China', 'kew': 'UNITED KINGDOM', 'sanford': 'United States', 'kernersville': 'UNITED STATES OF AMERICA', 'san rafael': 'United States', 'vladimiro-aleksandrovskoe selo': 'Russia', 'live oak': 'United States', 'simi valley': 'United States', 'clearbrook': 'United States', 'shatsk': 'Russia', 'kamensk-uralsky': 'Russia', 'bakhchisaray': 'Ukraine', 'lanjaron': 'SPAIN', 'trinidad': 'Cuba', 'chelan': 'United States', 'mesquite': 'United States', 'eldersburg': 'United States', 'sanandaj': 'Iran', 'indiannapolis': 'United States', 'bandar seri jempol': 'Malaysia', 'hetian': 'China', 'richmon': 'United States', 'crans-montana': 'Switzerland', 'noyabrsk': 'Russia', 'malang city': 'Indonesia', 'whiting': 'United States', 'dacula': 'United States', 'lumberton': 'United States', 'hackettstown': 'United States', 'jiayuguan': 'China', 'hsinchu': 'Taiwan', 'lüliang': 'China', 'sursee': 'SWITZERLAND', 'petit-lancy': 'SWITZERLAND', 'hudidah': 'Yemen', 'vapi': 'India', 'karatsu': 'Japan', 'chippenham': 'United Kingdom', 'zmir': 'Turkey', 'tongliao city': 'China', 'brattleboro': 'United States', 'hannibal': 'UNITED STATES OF AMERICA', 'luray': 'United States', 'beverley hills': 'United States of America', 'berryville': 'United States', 'kirovsk': 'Russia', 'clifton forge': 'United States', 'savannah': 'United States of America', 'apapa': 'NIGERIA', 'xiazhuang town': 'China', "x'ian": 'China', 'san clara': 'United States', 'riverton': 'United States', 'edinburg': 'United States', 'purley': 'UNITED KINGDOM', 'austinville': 'United States', 'brecon': 'UNITED KINGDOM', 'naberezhnyye chelny': 'Russia', 'algaria': 'Syria', 'ellesmere port': 'UNITED KINGDOM', 'brussells': 'Belgium', 'pointe-claire': 'Canada', 'lees summit': 'United States', 'kyzl-kia town': 'KYRGYZSTAN', 'chattanooga': 'United States', 'vyksa': 'Russia', 'knightdale': 'United States', 'baicheng': 'China', 'huaian city': 'China', 'yingkou': 'China', 'essentuki': 'Russia', 'windham': 'United States', 'lincolnwood': 'United States', 'rosarito baja': 'Mexico', 'pyi oo lwin': 'MYANMAR', 'sana': 'YEMEN', 'albir': 'Spain', 'bor': 'Russia', 'leninskoe': 'Russia', 'tengzhou': 'China', 'driffield': 'UNITED KINGDOM', 'rosemead': 'United States', 'lechang': 'China', 'secaucus': 'United States', 'tlajomulco de zuniga': 'Mexico', 'myawadi': 'Myanmar', 'carlsbad': 'United States', 'bayingolin mongol autonomous prefecture': 'China', 'chicago heights': 'United States', 'yulin': 'China', 'jounieh': 'Lebanon', 'tianzhuang town': 'China', 'badiraguato': 'Mexico', 'thatcham': 'UNITED KINGDOM', 'toms river': 'United States', 'hiakou': 'CHINA', 'manhattan beach': 'United States', 'dezful': 'Iran', 'antakya': 'Turkey', 'bridgend': 'UNITED KINGDOM', 'saint-quentin-en-yvelines cedex': 'France', 'arcelia': 'Mexico', 'lewisville': 'United States', 'olive branch': 'United States', 'san miguel de abona': 'Spain', 'beeston': 'United Kingdom', 'chipping norton': 'UNITED KINGDOM', 'hcmc': 'VIETNAM', 'fuyang city': 'China', 'astrakhan,': 'Russia', 'dalnerechensk': 'Russia', 'molesey': 'UNITED KINGDOM', 'staraya russa': 'Russia', 'heriot bay': 'Canada', 'sharypovo': 'Russia', 'qods town': 'IRAN', 'armonk': 'United States', 'hagerstown': 'United States', 'gavrilov-yam': 'Russia', 'yelets (elets)': 'Russia', 'delegaci¢n miguel hidalgo': 'Mexico', 'pelabuhan klang': 'Malaysia', 'kab. sukoharjo': 'Indonesia', 'bandar seri begawan\u200b': 'Brunei', 'kurchaloi': 'Russia', 'floyd': 'United States', 'nesconset': 'United States', 'burnham': 'United Kingdom', 'spathare': 'Albania', 'caret': 'United States', 'stanitsa medvedovskaya': 'Russia', 'irbit': 'Russia', 'hythe': 'United Kingdom', 'roselle': 'United States', 'midview city': 'Singapore', 'edgewater': 'United States', 'fushan': 'China', 'suifenhe': 'China', 'rasht': 'Iran', 'clovis': 'United States', 'rotkreuz': 'SWITZERLAND', 'marburg': 'Germany', 'centennial': 'UNITED STATES', 'norristown': 'United States', 'ivdel': 'Russia', 'tucker': 'United States', 'kislovodsk': 'Russia', 'zanino-pochinki': 'Russia', 'rio grande city': 'UNITED STATES OF AMERICA', 'burj al barajineh': 'Lebanon', 'east garrison': 'United States', "lee's summit": 'United States', 'kissimmee': 'United States', 'zoucheng': 'China', 'eniseysk': 'Russia', 'lushan city': 'China', 'highland village': 'United States', 'wolcott': 'United States', 'odense': 'Denmark', 'incheon': 'South Korea', 'east norwalk': 'United States', 'medford': 'United States', 'nilüfer': 'Turkiye', 'tapai': 'Taiwan', 'cottonwood heights': 'United States', 'albany': 'United States', 'handan': 'CHINA', 'quetta şehri': 'Pakistan', 'kamyshlov': 'Russia', 'huanggang city': 'China', 'zaporizhizhia': 'Ukraine', 'debolt': 'Canada', 'goodview': 'United States', 'ft. lauderdale': 'United States', 'saraybosna': 'Bosnia and Herzegovina', 'bay city': 'United States', 'eustis': 'United States', 'ratingen': 'GERMANY', 'kizilsu': 'China', 'workington': 'United Kingdom', 'bell': 'UNITED STATES OF AMERICA', 'reyhanli': 'Turkey', 'wethersfield': 'United States', 'genave': 'Switzerland', 'wirtz': 'United States', 'bimbo': 'Central African Republic', 'praha': 'Czech Republic', 'samborondon': 'ECUADOR', 'meihekou': 'China', 'barnoldswick': 'United Kingdom', 'fedosia': 'Ukraine', 'tadley': 'UNITED KINGDOM', 'southwick': 'UNITED KINGDOM', 'handforth': 'UNITED KINGDOM', 'huzhou city': 'China', 'healdsburg': 'United States', 'herzliya': 'Israel', 'fo tan sha tin': 'Hong Kong', 'pace': 'United States', 'faringdon': 'UNITED KINGDOM', 'kiselevsk': 'Russia', 'devon': 'ENGLAND', 'thalwil': 'SWITZERLAND', 'zhangshu': 'China', 'stranraer': 'UNITED KINGDOM', 'lincang': 'China', 'sudak': 'RUSSIAN FEDERATION', 'crimora': 'United States', 'redruth': 'United Kingdom', 'yang city': 'China', 'sakarya adapazari': 'Republic of Türkiye', 'massena': 'United States', 'jwaya': 'Lebanon', 'michigan city': 'United States', 'birkenhead': 'UNITED KINGDOM', 'korelyov': 'Russian Federation', 'midrand': 'South Africa', 'westerham': 'UNITED KINGDOM', 'rongjiawan town': 'CHINA', 'normal': 'United States', 'ferndale': 'United Kingdom', 'eatontown': 'United States', 'beesd': 'Netherlands', 'eye': 'UNITED KINGDOM', 'birstall': 'UNITED KINGDOM', 'tutaev': 'RUSSIA', 'beaumaris': 'UNITED KINGDOM', 'bee cave': 'United States', 'armavir': 'Russia', 'mosco': 'Russia', 'wohlen': 'Switzerland', 'bargoed': 'UNITED KINGDOM', 'donegal': 'IRELAND', 'bander amirabad': 'IRAN', 'east london': 'United Kingdom', 'alma': 'United States', 'san fernando del valle de catamarca': 'Argentina', 'cowdenbeath': 'UNITED KINGDOM', 'hereford': 'UNITED KINGDOM', 'shacklefords': 'United States', 'minot': 'UNITED STATES', 'w. tyler': 'United States', 'nanping city': 'China', 'borj el amri': 'Tunisia', 'new cairo': 'Egypt', 'liaoyuan': 'China', 'diemen': 'Netherlands', 'bakhchysaray': 'Ukraine', 'akqi town': 'China', 'northboro': 'United States', 'montreux': 'Switzerland', 'danjiangkou city': 'China', 'honaker': 'United States', 'south hero': 'United States', 'jawa tengah': 'Indonesia', 'elektrougli': 'Russia', 'yamunanagar': 'India', 'chipping campden': 'UNITED KINGDOM', 'bolbasovo': 'Belarus', 'mold': 'UNITED KINGDOM', 'bazaipan': 'China', 'johnson city': 'United States', 'birobidzhan': 'Russia', 'tarlac': 'Philippines', 'gaza city region': 'Palestine', 'boulder': 'United States', 'millom': 'UNITED KINGDOM', 'randolph': 'United States', 'cedar bluff': 'United States', 'feodosia': 'Ukraine', 'genoa': 'Italy', 'akron': 'United States', 'heanor': 'UNITED KINGDOM', 'fleetwood': 'UNITED KINGDOM', 'shreveport': 'UNITED STATES OF AMERICA', 'huaihua city': 'China', 'keswick': 'United Kingdom', 'pyatigorsk': 'Russia', 'richland': 'United States', 'new bedford,': 'United States', 'lufkin': 'United States', 'clayton': 'United States', 'ponteland': 'UNITED KINGDOM', 'panaji': 'INDIA', 'guangxi': 'China', 'west jordan': 'United States', 'malatya': 'Turkey', 'tuzla': 'Turkey', 'tsiolkovskii': 'Russia', 'bayingoleng mongolian autonomous prefecture': 'China', 'lesozavodsk': 'Russia', 'lenoir': 'United States', 'malang kora': 'Indonesia', 'bezhanitsy': 'Russia', 'koltsovo': 'Russia', 'bodaybo': 'Russia', 'medley': 'United States', 'sheyang city': 'China', 'hayward': 'United States', 'korolyev': 'Russia', 'wukang town': 'CHINA', 'qing city': 'China', 'pavlovskiy posad': 'Russia', 'shildon': 'UNITED KINGDOM', 'merrifield': 'United States', 'novocheboksarsk': 'RUSSIAN FEDERATION', 'pongchon': "Korea, Democratic People's Republic of", 'beyrouth': 'Lebanon', 'alagir': 'Russia', 'penrhyndeudraeth': 'UNITED KINGDOM', 'nizhny': 'RUSSIA', 'semenyih': 'Malaysia', 'aktau': 'KAZAKHSTAN', 'holliday': 'United States', "rui'an": 'China', 'saipan': 'United States', 'karamay city': 'China', 'xinghewan': 'China', 'shatura': 'Russia', 'west nyack': 'United States', 'elizabeth city': 'United States', 'pescara': 'Italy', 'nanching city': 'China', 'ishimbai city': 'RUSSIAN FEDERATION', 'appleton': 'UNITED STATES OF AMERICA', 'lambunao': 'Philippines', 'dimitrovgrad': 'RUSSIAN FEDERATION', 'egoryevsk': 'Russia', 'botou': 'China', 'larbert': 'UNITED KINGDOM', 'destrehan': 'United States', 'sidon': 'LEBANON', 'guilford': 'United States', 'bakirköy': 'REPUBLIC OF TÜRKIYE', 'xiakou town': 'CHINA', 'prauchap kiri khan': 'Thailand', 'syvtyvkar': 'Russia', 'stanitsa nezlobnaya': 'Russia', 'crowborough': 'United Kingdom', 'youngtown': 'United States', 'bell gardens': 'United States', 'ployarny': 'Russia', 'bengbu city': 'CHINA', 'mayangone': 'Myanmar', 'otradnyy': 'Russia', 'itajai': 'Brazil', 'south orange': 'United States', 'cremona,': 'Italy', 'little falls': 'United States', 'grodno/hrodna': 'Belarus', 'myawaddy': 'Myanmar', 'jalal-abad region': 'Kyrgyzstan', 'al meniyeh': 'LEBANON', 'ruleville': 'United States', 'st mashhad': 'Iran', 'itta bena': 'United States', 'palm beach gardens': 'United States', 'goole': 'UNITED KINGDOM', 'umraniye': 'REPUBLIC OF TÜRKIYE', 'al hasaka': 'Syria', 'balakot': 'Pakistan', 'mytishchi city': 'RUSSIAN FEDERATION', 'shahba': 'Syria', 'sanhe': 'China', 'montague': 'United States', 'juticalpa': 'Honduras', 'fairfield': 'United States of America', 'spanishtown': 'Jamaica', 'center quetta': 'Pakistan', 'evpatoria': 'Ukraine', 'buena park': 'United States', 'portadown': 'United Kingdom', 'sumqayit': 'AZERBAIJAN', 'todmorden': 'UNITED KINGDOM', 'saint charles': 'United States', 'burnely': 'UNITED KINGDOM', 'de leon springs': 'United States', 'holywell': 'UNITED KINGDOM', 'florissant': 'UNITED STATES', 'corsicana': 'United States', 'pyonyang': 'North Korea', 'vint hill': 'United States', 'achinsk': 'Russia', 'pochinok': 'Russia', 'deerfield beach': 'United States', 'brookline': 'United States', 'caeserea': 'ISRAEL', 'tianmen': 'China', 'kuybyshev': 'Russia', 'las vega': 'United States', 'kamensk-shakhtinsky': 'RUSSIAN FEDERATION', 'havana': 'Cuba', 'carlstadt': 'United States', 'kulunda': 'Russia', 'byrdstown': 'United States', '10th of ramadan city': 'Egypt', 'pontyclun': 'UNITED KINGDOM', 'kingsville': 'United States', 'sragen': 'Indonesia', 'boushehr': 'IRAN', 'luliang city': 'China', 'chapel-en-le-frith': 'United Kingdom', 'southend on sea': 'United Kingdom', 'bandar lengeh': 'Iran', 'mashha': 'Iran', 'tianzhu': 'China', 'batam': 'INDONESIA', 'southbridge': 'United States', 'zollikon': 'SWITZERLAND', 'west kirkby': 'UNITED KINGDOM', 'bedfrod': 'United States', 'laverne': 'United States', 'zhaoqing city': 'China', 'phuket': 'Thailand', 'alice springs': 'Australia', 'agno': 'SWITZERLAND', 'billingshurst': 'United Kingdom', 'taos': 'United States', 'kumachevo': 'RUSSIA', 'belzoni': 'United States', 'crozet': 'United States', 'perris': 'United States', 'canon city': 'United States', 'san llorenc': 'SPAIN', 'stapleford': 'UNITED KINGDOM', 'cicero': 'United States', 'rocklea': 'Australia', 'hildalgo': 'United States', 'beloozerskiy': 'Russia', 'mexacali': 'Mexico', 'twin falls': 'UNITED STATES OF AMERICA', 'wuwei': 'China', 'puyallup': 'United States', 'apatzingan': 'Mexico', 'vorsino': 'Russia', 'mexborough': 'UNITED KINGDOM', 'alresford': 'United Kingdom', 'cibinong': 'Indonesia', 'yencheng': 'China', 'al qounaitra': 'Syria', 'pabna': 'Bangladesh', 'sergiyev posad': 'Russia', 'newport new': 'United States', 'harleston': 'United Kingdom', 'bluff city': 'United States', 'zabadani': 'Syria', 'adygeysk': 'Russia', 'edcouch': 'United States', 'winnetka': 'United States', 'guadalupe': 'Mexico', 'dunnellon': 'United States', 'tavda': 'Russia', 'sterling heights': 'United States', 'wingdale': 'United States', 'maku': 'Iran', 'bideford': 'UNITED KINGDOM', 'herisau': 'Switzerland', 'highbridge': 'UNITED KINGDOM', 'richmons': 'United States', 'adeje': 'SPAIN', 'roswell': 'United States', 'byram': 'United States', 'sedgley': 'UNITED KINGDOM', 'west bridgford': 'UNITED KINGDOM', 'rocky gap': 'United States', 'ostashkov': 'Russia', 'white marsh': 'United States', 'naples': 'United States', 'teignmouth': 'United Kingdom', 'yuan guilin city': 'China', 'savion': 'Israel', 'westerville': 'United States', 'dinwiddie': 'United States', 'marlborough': 'United States', 'st catharines': 'CANADA', 'scarsdale': 'United States', 'sofia city': 'Bulgaria', 'al aweer': 'United Arab Emirates', 'jiangmen city': 'China', 'ashbourne': 'UNITED KINGDOM', 'damietta': 'Egypt', 'cassville': 'United States', 'sham alam': 'Malaysia', 'wonsan': 'North Korea', 'rutland': 'UNITED KINGDOM', 'worland': 'United States', 'ismailia': 'Egypt', 'dyatkovo': 'Russia', 'hodges': 'United States', 'daqing': 'China', 'dunfermline': 'UNITED KINGDOM', 'potomac': 'United States', 'kolhapur': 'INDIA', 'kondoz': 'AFGHANISTAN', 'tigard': 'United States', 'ilam': 'Iran', 'west mclean': 'United States', 'jamnagar': 'India', 'llopango': 'El Salvador', 'anadyr chukotka': 'Russia', 'chuanshan town': 'China', 'artux': 'China', "sa'adah": 'Yemen', 'new dedlhi': 'India', 'rawtenstall': 'UNITED KINGDOM', 'belgorod-22': 'Russia', 'standish': 'United Kingdom', 'lipetsk oblast': 'Russia', 'karaçi': 'Pakistan', 'san pedro sula': 'Honduras', 'krasnoshchyokovo': 'Russia', 'shuangyashan city': 'CHINA', 'zhuzhou hunan': 'China', 'tamu': 'MYANMAR', 'canonsburg': 'United States', 'palos hills': 'UNITED STATES OF AMERICA', 'el monte': 'United States', 'lanexa': 'United States', 'tonypandy': 'United Kingdom', 'ulsn-ude': 'Russia', 'mississauga': 'Canada', 'udaipur': 'India', 'tagkawayan': 'Philippines', 'fayette': 'United States', 'church road': 'United States', 'highland': 'United States', 'leningradskaya': 'Russia', 'qamdo': 'China', 'iquitos': 'Peru', 'tangshan': 'China', 'downers grove': 'United States', 'vahdat city': 'Tajikistan', 'ayungon': 'PHILIPPINES', 'klintsy': 'Russia', 'lake city': 'United States', 'aliso viejo': 'United States', 'pomona': 'United States', 'arbon': 'SWITZERLAND', 'denny': 'United Kingdom', 'toliatti': 'Russia', 'ames': 'United States', 'hissar': 'Tajikistan', 'yokohama-shi': 'Japan', 'jolfa': 'IRAN', 'bağdad': 'Iraq', 'somerville': 'United States', 'cockermouth': 'UNITED KINGDOM', 'shelby': 'United States', 'chester le street': 'United Kingdom', 'zǭrich': 'Switzerland', 'pleasantville': 'United States', 'sarajevo kanton': 'Bosnia and Herzegovina', 'kittanning': 'United States', 'g. novosibirsk': 'Russia', 'piedras negras': 'Mexico', 'yangquan city': 'China', 'portree': 'United Kingdom', 'burbank': 'United States', 'darvel': 'UNITED KINGDOM', 'greensburg': 'United States', 'sumerduck': 'United States', 'spin boldak district': 'Afghanistan', 'uzlovaya': 'Russia', 'minerva': 'United States', 'lalpura': 'Afghanistan', 'honiton': 'United Kingdom', 'kuragino': 'Russia', 'basre': 'Iraq', 'chaohu shi': 'China', 'rustburg': 'United States', 'whaley bridge': 'UNITED KINGDOM', 'lantau': 'Hong Kong', 'salcombe': 'UNITED KINGDOM', 'sulaymaniya': 'Iraq', "namp'o": 'NORTH KOREA', 'sojeong-myeon': 'South Korea', 'bolshie vyazyomy': 'Russia', 'huangshi': 'China', 'rajaee city': 'Iran', 'vladimir city': 'RUSSIAN FEDERATION', 'kushchyovskaya': 'Russia', 'jonesboro': 'United States', 'sutton surrey': 'United Kingdom', 'bisceglie': 'ITALY', 'thousand oaks': 'United States', 'wau': 'South Sudan', 'habana': 'Cuba', 'pingliang city': 'CHINA', 'keeling': 'United States', 'la plata': 'United States', 'zeya': 'Russia', 'kazachinskoe': 'Russia', 'paranaque city': 'PHILIPPINES', 'kysyl-syr': 'Russia', 'port huron': 'United States', 'zhangjiagang': 'China', 'varadero': 'Cuba', 'holbrook': 'United States', 'bollington': 'UNITED KINGDOM', 'tysons corner': 'United States', 'disputanta': 'United States', 'prudhoe': 'UNITED KINGDOM', 'oktyabrskiy': 'Russia', 'needham': 'United States', 'nverness': 'SOUTH AFRICA', 'espoo': 'Finland', 'pingdingshan': 'China', 'rowley regis': 'UNITED KINGDOM', 'manquin': 'United States', 'virgilina': 'United States', 'cenxi': 'China', 'zhaoqing': 'China', 'armidale': 'Australia', 'kab surabaya': 'Indonesia', 'tehsil lahore city': 'Pakistan', 'kelamayi city': 'China', 'bataysk': 'Russia', 'anstruther': 'UNITED KINGDOM', 'saltillo': 'United States', 'st basre': 'Iraq', 'datong city': 'China', 'attleboro': 'United States', 'burke': 'United States', 'phang rang-thap cham city': 'Vietnam', 'menzingen': 'SWITZERLAND', 'homestead': 'United States', 'arkansas city': 'United States', 'falcon heights': 'United States', 'danyang': 'China', 'ili prefecture': 'China', 'north bergen': 'United States', 'kancheepuram': 'India', 'apeldoorn': 'NETHERLANDS', 'san miguel': 'El Salvador', 'new philadelphia': 'United States', 'bucharest': 'Romania', 'beverley': 'UNITED KINGDOM', 'tselinnoe': 'Russia', 'zavolzhe': 'Russia', 'balashov': 'Russia', 'valdosta': 'United States', 'indianola': 'United States', 'dundonald': 'UNITED KINGDOM', 'clackmannanshire': 'UNITED KINGDOM', 'battle creek': 'United States of America', 'bogorodsk': 'Russia', 'gilmer': 'United States', 'enniskillen': 'UNITED KINGDOM', 'hsinchu city': 'Taiwan', 'yingcheng city': 'China', 'kalamazoo': 'United States', 'monsey': 'United States', 'deerfield': 'United States', 'sedona': 'UNITED STATES OF AMERICA', 'belmopan': 'Belize', 'prestwick': 'United Kingdom', 'st ekaterinburg': 'RUSSIAN FEDERATION', 'malé': 'Maldives', 'saint petersbug': 'Russia', 'ivanovka': 'Russia', 'haute-kotto': 'CENTRAL AFRICAN REPUBLIC', 'suzemka': 'Russia', 'navoiy city': 'Uzbekistan', 'bint jbeil': 'Lebanon', 'san carlos': 'Costa Rica', 'wuxi,': 'China', 'conway': 'United States', 'trichur': 'India', 'alyth': 'UNITED KINGDOM', 'highland park': 'United States', 'torzhok': 'RUSSIAN FEDERATION', 'hacienda heights': 'United States', 'guangyuan city': 'China', 'prokhladny': 'Russia', 'agios athanasios': 'Cyprus', 'san clemente': 'United States', 'oakdale': 'United States of America', 'walton': 'United States', 'revda': 'Russia', "ma'erkang city": 'China', 'lenoir city': 'United States', 'south dartmouth': 'United States', 'kfar kila': 'LEBANON', 'huainan shi': 'China', 'shali': 'Russia', 'brugherio': 'Italy', 'haddington': 'UNITED KINGDOM', 'mianshan': 'China', 'city of snezhinsk': 'RUSSIA', 'terryville': 'United States', 'lepe': 'Spain', 'beverly': 'United States', 'rasaught': 'Myanmar', 'stuart': 'United States', 'pittsboro': 'United States', 'wales': 'UNITED KINGDOM', 'damascus countryside': 'Syria', 'klang': 'Malaysia', 'shiroli': 'INDIA', 'sevsk': 'Russia', 'svetlogorsk': 'Belarus', 'tieling': 'China', 'newmarket on fergus': 'IRELAND', 'santa monica': 'United States', 'tarija': 'Bolivia', 'heitan city': 'China', 'kuningan': 'Indonesia', 'invercargill': 'NEW ZEALAND', 'wheat ridge': 'United States', 'muskegon': 'United States', 'cajeme': 'Mexico', 'forest lake': 'United States', 'newcastle under lyme': 'UNITED KINGDOM', 'shanliurfa': 'Turkey', 'sariaya': 'PHILIPPINES', 'boonsboro': 'United States', 'hopkins': 'UNITED STATES OF AMERICA', 'taix': 'Yemen', 'stary gorodok': 'Russia', 'los baños': 'Philippines', 'st. gallen': 'Switzerland', 'stroudsburg': 'United States', 'shulan': 'China', 'n chesterfield': 'United States', 'providencia': 'Chile', 'shin': 'Syria', 'boonville': 'United States', 'posyolok strelka': 'Russia', 'ashsboro': 'United States', "people's republic of luzhou": 'CHINA', 'giza': 'Egypt', 'yuncheng': 'China', 'leominster': 'UNITED KINGDOM', 'march': 'UNITED KINGDOM', 'etsky': 'Russia', 'corvallis': 'United States', 'albaidah': 'Yemen', 'sasovo': 'Russia', 'deyang shi': 'China', 'evpatoriya': 'Ukraine', 'zakamensk': 'Russia', 'anchorage': 'United States', 'volzhsky': 'Russia', 'longton': 'United Kingdom', 'wimborne': 'UNITED KINGDOM', 'akil': 'Mexico', 'mirnyy': 'Russia', 'caba buenos aires': 'Argentina', 'derry': 'NORTHERN IRELAND (UNITED KINGDOM)', 'kaesong': 'North Korea', 'suitland': 'United States', 'preston lancashire': 'United Kingdom', 'franklinton': 'United States', 'köln': 'Germany', 'chard': 'UNITED KINGDOM', 'chungju-si': 'South Korea', 'bazargan': 'IRAN', 'malmoe': 'Sweden', 'vincennes': 'United States', "dara'a": 'Syria', 'st. blazey': 'UNITED KINGDOM', 'bitola': 'North Macedonia', 'gubakha': 'Russia', 'nishni novgorod': 'Russian Federation', 'la mirada': 'United States', 'estado distrito capital': 'Venezuela', 'newburgh': 'United States', 'ludgershall': 'United Kingdom', 'rio bravo': 'Mexico', 'pennsauken': 'United States', "l'aquila": 'Italy', 'horncastle': 'UNITED KINGDOM', 'kirovski': 'Russian Federation', 'cardigan': 'United Kingdom', 'leicester city': 'United Kingdom', 'chaguanas': 'Trinidad and Tobago', 'villa nova de gaia': 'Portugal', 'niigata': 'Japan', 'mineral': 'United States', 'ouagadougou': 'BURKINA FASO', 'castle rock': 'United States', 'beylikdüzü': 'Turkey', 'sluis': 'Netherlands', 'bogotol': 'Russia', 'taian': 'China', 'elizabethton': 'United States', 'rural retreat': 'United States', 'st leonards-on-sea': 'United Kingdom', 'homewood': 'United States', 'kirovo-chepetsk': 'Russia', 'dora': 'LEBANON', 'rzhev': 'Russia', 'saint cloud': 'United States', 'del ray beach': 'United States', 'kolwezi': 'Congo (Democratic Republic of The)', 'blandford forum': 'UNITED KINGDOM', 'icheon': 'South Korea', 'maitreya': 'China', 'folsom': 'United States', 'lively': 'United States', 'dortyol': 'Turkey', 'asaluyeh': 'Iran', 'kikac': 'CANADA', 'gaotieling town': 'China', 'botlikh': 'Russia', 'north garden': 'United States', 'sofala': 'Mozambique', 'stoke': 'United Kingdom', 'leek': 'United Kingdom', 'sonora': 'MEXICO', 'liling': 'China', 'lehi': 'United States', 'haimen': 'China', 'gorod izhevsk': 'Russia', 'marjah': 'Afganistan', 'vesyoly': 'Russia', 'iloilo province': 'Philippines', 'port loius': 'Mauritius', 'gumi-si': 'South Korea', 'preah sihanouk city': 'CAMBODIA', 'suihua city': 'China', 'maryport': 'United Kingdom', 'fengdong new town': 'China', 'tumushuk city': 'China', 'ar-rayyan': 'Qatar', 'xianning city': 'China', 'chiah': 'Lebanon', 'sigourney': 'United States', 'maranhão': 'BRAZIL', 'buleleng': 'Indonesia', 'wilmot': 'United States', 'megion': 'Russia', 'barboursville': 'United States', 'najaf': 'Iraq', 'sucre': 'VENEZUELA', 'northbridge': 'Australia', 'beauly': 'United Kingdom', '九龍': 'Hong Kong', 'broadview': 'United States', 'severomosrsk': 'Russia', 'crouse': 'United States', 'chongzuo': 'China', 'adliswil': 'SWITZERLAND', 'babylon': 'United States', 'quincy': 'United States', 'orchard hill': 'United States', 'lacombe': 'United States', 'terre haute': 'UNITED STATES OF AMERICA', 'el hachiniia': 'Algeria', 'qianjiang shi': 'China', 'burgess hill': 'UNITED KINGDOM', 'cankaya': 'REPUBLIC OF TÜRKIYE', 'bartlett': 'United States', 'pilibangan': 'India', 'barton-upon-humber': 'UNITED KINGDOM', 'plast': 'RUSSIA', 'zhukovski': 'Russia', 'wuhu shi': 'China', 'lyskovo': 'Russia', 'grand saline': 'UNITED STATES', 'verbena': 'United States', 'winthrop': 'United States', 'rochford': 'UNITED KINGDOM', 'port charlotte': 'United States of America', 'muharraq': 'Bahrain', 'haarlem': 'Netherlands', 'maitland': 'United States', 'namyangju-si': 'South Korea', 'benxi city': 'CHINA', 'naucalpan de juarez': 'Mexico', 'lappeenranta': 'Finland', 'yiyang city': 'China', 'new hyde park': 'United States', 'changzhou shi': 'China', 'afton': 'United States', 'haeju': 'North Korea', 'conwy': 'United Kingdom', 'east rochester': 'United States', 'genovie': 'SWITZERLAND', 'urbandale': 'United States', 'hatfield': 'United Kingdom', 'cybercity': 'MAURITIUS', 'al-hasaka': 'SYRIA', 'meyrin': 'SWITZERLAND', 'gombe': 'CONGO (DEMOCRATIC REPUBLIC OF THE)', 'vileyka': 'Belarus', 'odenton': 'United States', 'tega cay': 'United States', 'kumertau': 'RUSSIAN FEDERATION', 'frankfurt main': 'Germany', 'pikesville': 'United States', 'hoylake': 'United Kingdom', 'paramount': 'United States', 'chuxiong city': 'China', 'hi-tech industrial development zone': 'China', 'bulle': 'SWITZERLAND', 'musan': 'North Korea', 'gebze': 'Republic of Türkiye', 'kuibyshev': 'RUSSIAN FEDERATION', 'peşaver': 'Pakistan', 'dusseldorf': 'Germany', 'st port louis': 'Mauritius', 'jette': 'BELGIUM', 'cehrnyakhovsk': 'Russia', 'seri kembangan': 'Malaysia', 'cottage grove': 'United States', 'zato sibirskiy': 'Russia', 'dale city': 'United States', 'hillsborough': 'United Kingdom', 'dazhou': 'China', 'bangaluru': 'India', 'odunpazari': 'Turkey', 'jinhua town': 'CHINA', 'whitehouse station': 'UNITED STATES', 'town of azov': 'Ukraine', 'wynantskill': 'United States', 'white lake': 'United States', 'jdeidet': 'Lebanon', "st. john's": 'Antigua and Barbuda', 'rosva': 'Russia', 'crandall': 'United States', 'ghotki': 'Pakistan', 'quinton': 'United States', 'nihzny novgorod': 'Russia', 'boyle': 'UNITED STATES', 'svobodny': 'Russia', 'greenwood village': 'United States', 'mudanjiang city': 'China', 'meishan city': 'China', 'martigny': 'SWITZERLAND', 'al hudaydah': 'Yemen', 'marbella': 'SPAIN', 'hod hasharon': 'Israel', 'morehead city': 'United States', 'bharatpur': 'INDIA', 'mirnovskoe': 'RUSSIAN FEDERATION', 'ponce': 'Puerto Rico', 'moss point': 'United States', 'chelsea': 'United States', 'suvorov': 'Russian Federation', 'yulin shi': 'China', 'jhelum': 'Pakistan', 'haidian district': 'China', 'khanewal': 'PAKISTAN', 'cornelius': 'United States', 'new milford': 'United States', 'waverly': 'United States', 'serdobsk': 'Russia', 'vladivostock': 'Russia', 'poca': 'United States', 'cochin': 'India', 'orumiyeh': 'IRAN', 'potton': 'United Kingdom', 'dorogobuzh': 'Russia', 'tullus': 'Sudan', 'figueira da foz': 'Portugal', 'wildwood': 'United States', 'ciudad de panamá': 'Panama', 'laiyang': 'China', 'hebden bridge': 'United Kingdom', 'el segundo': 'United States', 'deir al-balah': 'Palestinian Territories', 'jorvas': 'Finland', 'nanan city': 'China', 'castletownbere': 'IRELAND', 'lake forest': 'United States', 'fuling': 'China', 'labwe': 'LEBANON', 'macedon': 'United States', 'henan': 'China', 'fateh jang': 'Pakistan', 'wymondham': 'UNITED KINGDOM', 'wenling': 'China', 'makatai city': 'Philippines', 'alameda': 'United States', 'gurevsk': 'Russia', 'shenliu town': 'CHINA', 'plainview': 'United States', 'bandar seri begawan': 'Brunei', 'thị trấn lâm': 'Vietnam', 'oilville': 'United States', 'lutherville timonium': 'United States', 'geelong': 'AUSTRALIA', 'hunchun': 'China', 'saint clair shores': 'United States', 'jianyang': 'China', 'pago pago': 'United States', 'quzhou': 'China', 'point richmond': 'United States', 'kowlonn': 'Hong Kong', 'gilroy': 'United States', 'moscow city': 'RUSSIAN FEDERATION', 'city taizhou': 'CHINA', 'norton': 'United States', 'bagcilar': 'Turkey', 'lytham': 'UNITED KINGDOM', 'partizan': 'RUSSIAN FEDERATION', 'yuanjiang': 'China', 'surrey, bc v4n 1j7': 'CANADA', 'yarrowyck': 'AUSTRALIA', 'kakinada': 'India', 'gorinchem': 'Netherlands', 'al ghaydah': 'Yemen', 'east kilbride': 'UNITED KINGDOM', 'lamu': 'Kenya', 'panjing city': 'China', 'pacific palisades': 'United States', 'commerce': 'United States', 'sancaktepe': 'Turkey', 'leigh on sea': 'UNITED KINGDOM', 'dar-es-salaam': 'TANZANIA', 'north rhine-westphalia': 'Germany', 'north tazewell': 'United States', 'verwood': 'UNITED KINGDOM', 'lewiston': 'United States', 'kufstein': 'AUSTRIA', 'jdeidet el metn': 'Lebanon', 'city of sofia': 'Bulgaria', 'beamsville': 'CANADA', 'dolgaprudni': 'Russian Federation', 'hingham': 'United States', 'asuncion': 'Paraguay', 'pfeffingen': 'Switzerland', 'arizona': 'United States', 'santa cruz de l sierra': 'Bolivia', 'los angele': 'United States', 'shalya': 'Russia', 'pembroke pines': 'UNITED STATES', 'san gabriel': 'United States', 'santa venera': 'Malta', 'qianjiang': 'China', 'kennett square': 'United States', 'st. kamensk-uralsky': 'RUSSIAN FEDERATION', 'holliston': 'United States', 'changyuan': 'China', 'al kazimiyah': 'IRAQ', 'thonex': 'Switzerland', 'kish': 'Iran', 'novy urengoy': 'Russian Federation', 'blaine': 'United States', 'gardena': 'United States', 'spokane': 'United States', 'mirnoye': 'Ukraine', 'hubei province': 'China', 'gallatin': 'United States', 'xichang city': 'China', 'babushara': 'Georgia', 'pulaski': 'United States', 'east lyme': 'United States', 'bebington': 'UNITED KINGDOM', "lu'an": 'China', 'ob': 'RUSSIAN FEDERATION', 'the city of surgut': 'Russia', 'burntwood': 'UNITED KINGDOM', 'mandalay city': 'Myanmar', 'nasr city, cairo': 'Egypt', 'baldwin': 'United States', 'karachev': 'Russia', 'songzi city': 'China', 'wotton-under-edge': 'United Kingdom', 'copenhagen': 'DENMARK', 'khabary': 'Russia', 'new fairfield': 'United States', 'highstown': 'United States', 'brea': 'UNITED STATES OF AMERICA', 'zhaoyuan': 'China', 'potsdam': 'Germany', 'paya vista': 'United States', 'yasny': 'Russia', 'cardenas': 'Cuba', 'meiktila': 'Myanmar [Burma]', 'pevek': 'Russia', 'sittensen': 'GERMANY', 'kuqa': 'China', 'pankovka': 'Russia', 'lida': 'Belarus', 'plantation': 'United States', 'royal leamington spa': 'UNITED KINGDOM', 'rubavu': 'RWANDA', 'pingxiang city': 'China', 'moyock': 'United States', 'lake park': 'United States', 'arundel': 'United Kingdom', 'kennedyville': 'United States', 'hrodna': 'Belarus', 'ivatsevichy': 'Belarus', 'fanwood': 'United States', 'fletcher': 'United States', 'antibes': 'France', 'xinyu': 'China', "yong'an": 'China', 'lansing': 'United States', 'wilayah persekutuan kuala lumpur': 'Malaysia', 'harrison': 'United States', 'chevy chase': 'United States', 'alzey': 'Germany', 'bruxelles': 'BELGIUM', 'al-bukamal': 'SYRIA', 'eureka': 'United States', 'suez': 'Egypt', 'greeneville': 'United States', 'bokhan': 'Russia', 'shijiao town': 'China', 'kowloon bay': 'HONG KONG', 'basle': 'Switzerland', 'pafos': 'Cyprus', 'westborough': 'United States', 'al miyeh w miyeh': 'LEBANON', 'taiz city': 'Yemen', 'selkhoztekhnika': 'Russian Federation', 'qianjiang city': 'CHINA', 'west midlands': 'UNITED KINGDOM', 'wenxing town': 'CHINA', 'frederciksburg': 'United States', 'tuscaloosa': 'United States', 'nizhnii novgorod': 'Russia', 'beit layeh': 'Palestine', 'cliffside park': 'United States', 'namangan': 'Uzbekistan', 'pamplona': 'PHILIPPINES', 'chia cundinamarca': 'Colombia', 'shilovo': 'Russia', 'lynden': 'United States', 'nizhnyaya tura': 'RUSSIAN FEDERATION', 'londonderry derry': 'United Kingdom', 'nazarovo': 'Russia', 'chahgay': 'Pakistan', 'ruggell': 'LIECHTENSTEIN', 'kota bekasi': 'INDONESIA', 'mafraq': 'Jordan', 'woolwich_x000d_\ntownship': 'United States', "pu'er": 'China', 'polk city': 'United States', 'vadnais heights': 'United States', 'encinitas': 'United States', 'lauderdale': 'United States', 'kab. kota malang': 'Indonesia', 'kavalerovo': 'Russia', 'vyazma': 'Russia', 'mabank': 'UNITED STATES', 'kamensk-shakhtinskiy': 'Russia', 'washington twp': 'United States', 'kenmore': 'United Kingdom', 'minehead': 'UNITED KINGDOM', 'austell': 'United States', 'stow': 'United States', 'clarkston': 'United States', 'saltcoats': 'United Kingdom', 'paramont': 'United States', 'alberta': 'United States', 'rizhao city': 'CHINA', 'thun': 'Switzerland', 'kuantan': 'Malaysia', 'yarm': 'United Kingdom', 'winters': 'United States', 'wrex': 'UNITED KINGDOM', 'lahor': 'Pakistan', 'naberezhny chelny': 'Russian Federation', 'stanardsville': 'United States', 'troitskoe': 'Russia', 'south el monte': 'United States', 'kashagar town': 'China', 'stockton heath': 'UNITED KINGDOM', 'huayin': 'China', 'buxton': 'United Kingdom', 'rutherglen': 'United States', 'alushta': 'Ukraine', 'zhushan town': 'China', 'vakaga prefecture': 'Central African Republic', 'griffith': 'United States', 'fujayrah': 'United Arab Emirates', 'south boardman': 'United States', 'queensland': 'Australia', 'ft eustis': 'United States', 'aleksandrow lodzki': 'POLAND', 'hilton head': 'United States', 'greenhithe': 'United Kingdom', 'congers': 'United States', 'nagoya-shi': 'JAPAN', 'mount isa': 'Australia', 'sao cristovao': 'BRAZIL', 'volgorad': 'RUSSIAN FEDERATION', 'pengzhou': 'China', 'wayne': 'United States', 'wafangdian': 'China', 'barrow-in-furness': 'UNITED KINGDOM', 'district islamabad': 'Pakistan', 'redlands': 'United States', 'dilovasi': 'REPUBLIC OF TÜRKIYE', 'ghobeiry': 'Lebanon', 'pochtovoe otdelenie putilkovo': 'Russia', 'hessle': 'UNITED KINGDOM', 'middlebury': 'United States', 'can tho city': 'Vietnam', '利馬索爾': 'Cyprus', 'kabupaten sidoarjo': 'Indonesia', 'frankfort': 'United States', 'hlaingbwe': 'Myanmar', 'château-chinon': 'France', 'lyuberetskiy': 'Russian Federation', 'minatitlan': 'MEXICO', 'shakhty': 'Russia', 'leonards-on-sea': 'United Kingdom', 'woodford greeni': 'UNITED KINGDOM', 'kulim': 'Malaysia', 'henley on thames': 'United Kingdom', 'ensenada': 'Mexico', 'humus': 'Syria', 'golmud': 'China', 'treharris': 'UNITED KINGDOM', 'west charleston': 'United States', 'casablanca': 'Morocco', 'romulus': 'United States', 'forest town': 'UNITED KINGDOM', 'mbale': 'UGANDA', 'neston': 'UNITED KINGDOM', 'cham': 'Switzerland', 'crown point': 'United States', 'bredbury': 'UNITED KINGDOM', 'fenton': 'United States', 'quanzhou city': 'CHINA', 'bejing': 'CHINA', 'kowloon city': 'Hong Kong', 'farmington hills': 'United States of America', 'church stretton': 'UNITED KINGDOM', 'gromovskoe': 'Russia', 'anamosa': 'United States', 'talkah': 'Syria', 'solon': 'UNITED STATES', 'zhoukou': 'China', 'beith': 'United Kingdom', 'musselburgh': 'UNITED KINGDOM', 'saint-aubin sauges': 'Switzerland', 'adelanto': 'United States', 'bazhou': 'China', 'hillsboro': 'United States', 'bampton': 'UNITED KINGDOM', 'hyrum': 'United States', 'chingford': 'UNITED KINGDOM', 'stone mountain': 'United States', 'daye': 'CHINA', 'rajshahi mahanagor': 'Bangladesh', 'seongnam': 'South Korea', 'komsomola': 'Russia', 'colonial beach': 'United States', 'stonehaven': 'UNITED KINGDOM', 'wuyishan city': 'China', 'greve': 'Denmark', 'walton on thames': 'UNITED KINGDOM', 'baldock': 'UNITED KINGDOM', 'bayfield': 'United States', 'manteca': 'United States', 'xingcheng': 'China', 'primorsk,': 'Russia', 'spartanburg': 'United States', 'swoope': 'United States', 'port melbourne': 'Australia', 'chekhov': 'Russia', 'buford': 'United States', 'phû lý': 'Vietnam', 'bexhill on sea': 'United Kingdom', 'orocovis': 'Puerto Rico', 'new brunswick': 'UNITED STATES', 'borovsk': 'Russia', 'rhyl': 'United Kingdom', 'vung tau': 'Vietnam', 'lovettsville': 'United States', 'narrows': 'United States', 'yonkers': 'United States', 'nueva tijuana': 'Mexico', 'northfleet': 'United Kingdom', 'sirmour': 'India', 'kronshtadt': 'Russia', 'hanwood': 'Australia', 'woolwine': 'United States', 'manchester,': 'United States', 'moscow mills': 'United States', 'swakron': 'United States', 'majuro republic': 'MARSHALL ISLANDS', 'st. saint petersburg': 'Russia', 'north charleston': 'United States', 'melehovo': 'RUSSIAN FEDERATION', 'sylvania': 'United States', 'latham': 'United States', 'tumshuk': 'China', 'eskişchir': 'Türkiye', 'zaragosa': 'Philippines', 'white stone': 'United States', 'pontardawe': 'UNITED KINGDOM', 'manning': 'United States', 'zhaoqing shi': 'China', 'merchantville': 'United States', 'montebello': 'United States', 'mikhmoret': 'Israel', 'novosaratovka': 'Russia', 'tinton falls': 'United States', 'ebenfurth': 'Austria', 'venaville': 'United States', 'yartsevo': 'Russia', 'grandevent': 'SWITZERLAND', 'white plains': 'United States', 'summersville': 'United States', 'cork': 'UNITED KINGDOM', 'helmand province': 'AFGHANISTAN', 'dresden': 'Germany', 'myingyan': 'MYANMAR', 'verkhniy ufaley': 'Russia', 'saline': 'United States', 'bowmansville': 'United States', 'caldwell': 'United States', 'bulatnikovo': 'Russia', 'guigang': 'China', 'hebburn': 'UNITED KINGDOM', 'heckmondwyde': 'UNITED KINGDOM', 'magherafelt': 'NORTHERN IRELAND (UNITED KINGDOM)', 'vilnus': 'Lithuania', 'elkton': 'United States', 'saltburn-by-the-sea': 'UNITED KINGDOM', 'baniyas': 'Syria', 'krasnozavodsk': 'Russia', 'potters bar': 'UNITED KINGDOM', 'süleymaniye': 'Iraq', 'tranent': 'UNITED KINGDOM', 'west bank': 'PALESTINE (WEST BANK-GAZA)', 'merrillville': 'UNITED STATES OF AMERICA', 'toranto': 'Canada', 'saint leonard': 'United States of America', 'droitwich': 'UNITED KINGDOM', 'saint perstburg': 'RUSSIAN FEDERATION', 'batamote': 'Mexico', 'visp': 'SWITZERLAND', 'boissevain': 'United States', 'jiangyang': 'China', 'ballyclare': 'UNITED KINGDOM', 'tshchelkovo': 'Russia', 'mahshahr': 'IRAN', 'coonamble': 'Australia', 'onancock': 'United States', 'barzeh': 'Syria', 'new-york': 'United States', 'taichung city': 'Taiwan', 'fordsburg': 'South Africa', 'flanders': 'United States', 'sulaymaniyah': 'IRAQ', 'south whitley': 'United States', 'zuwarah': 'Libya', 'flushing': 'United States', 'komsomolskoe': 'Russia', 'mountain ash': 'United Kingdom', 'surat thani': 'Thailand', 'sungnam-si': 'South Korea', 'al-mansour': 'Iraq', 'priargunsk': 'Russia', 'zachary': 'United States', 'winona': 'United States', 'malahide': 'Ireland', 'medan': 'INDONESIA', 'donggang': 'China', 'north babylon': 'United States', 'sidmouth': 'UNITED KINGDOM', 'glenwood': 'United States', 'lingbao city': 'CHINA', 'davie': 'United States', 'olso': 'United States', 'hartbeespoort': 'SOUTH AFRICA', 'perivale': 'UNITED KINGDOM', 'chengmai county': 'China', 'marianna': 'United States', 'hünenberg': 'SWITZERLAND', 'yangong': 'Myanmar', 'suizhou': 'China', 'littleborough': 'UNITED KINGDOM', 'garrison': 'United States', 'tieling city': 'China', 'minnetonka': 'United States', 'hallifax': 'United Kingdom', 'ciudad': 'Guatemala', 'samarqand': 'Uzbekistan', 'colmer': 'France', 'montclair': 'United States', 'somers': 'United States', 'sarasota': 'United States', 'clarence': 'United States', 'nambour': 'Australia', 'baraki': 'Russia', 'woluwe-saint-lambert': 'Belgium', 'city moscow': 'Russia', 'hengshui, city': 'China', 'skegness': 'UNITED KINGDOM', 'wadhurst': 'UNITED KINGDOM', 'sadah': 'Yemen', 'deinze': 'Belgium', 'majuro mh': 'MARSHALL ISLANDS', 'merine': 'Algeria', 'ladys island': 'United States', 'tantallon': 'CANADA', 'iasi': 'Romania', 'bingham farms': 'United States', 'tynemouth': 'UNITED KINGDOM', 'mamadysh': 'Russia', 'huizhou city': 'China', 'stanleytown': 'United States', 'canoga park': 'United States', 'sepang': 'Malaysia', 'valley center': 'United States', 'bandar bushehr': 'IRAN', 'savvushka': 'Russia', 'tongchuan': 'CHINA', 'santa cruz de la siena': 'Bolivia', 'north hempstead': 'United States', 'liaoning city': 'CHINA', 'krasnoturyinsk': 'Russia', 'bagdad': 'Iraq', 'dodoma': 'Tanzania', 'weizhou town': 'China', 'rolling fork': 'United States', 'douglasville': 'UNITED STATES OF AMERICA', 'lithonia': 'UNITED STATES OF AMERICA', 'blaydon on tyne': 'UNITED KINGDOM', 'dalnegorsk': 'Russia', 'ulaanbataar': 'Mongolia', 'goodyear': 'United States', 'colima': 'Mexico', 'tall': 'Syria', 'mandaluyong city': 'PHILIPPINES', 'tara': 'Russia', 'heswell': 'UNITED KINGDOM', 'huizho': 'China', 'upminster': 'United Kingdom', 'sysert district': 'Russia', 'vladivostok city': 'RUSSIAN FEDERATION', 'lake ridge': 'United States', 'veedersburg': 'United States', '6th of october city': 'Egypt', 'longview': 'United States', 'naberezhnye chelny city': 'RUSSIAN FEDERATION', 'bullhead city': 'United States', 'mary esther': 'United States', 'capron': 'United States', 'usolye sibirskoye': 'China', 'binjai': 'Malaysia', 'somerton': 'UNITED KINGDOM', 'studio city': 'United States', 'uhrichsville': 'United States', 'kill devil hills': 'United States', 'st. neots': 'United Kingdom', 'krasnoturansk': 'Russia', 'conyers': 'United States', 'ozerny': 'Russia', 'ahvaz': 'Iran', 'henry': 'United States', 'velizh': 'Russia', 'minh city': 'Vietnam', 'evansdale': 'Iowa', 'skelmersdale': 'UNITED KINGDOM', 'hreik': 'Lebanon', 'wuwei city': 'China', 'tobyl': 'Kazakhstan', 'haikou city province': 'China', 'tinana': 'Australia', 'leimuiden': 'Netherlands', "lu 'an city": 'China', 'deer park': 'United States', 'gros-islet': 'Saint Lucia', 'atamanovskoe': 'Russia', 'mozdok': 'Russia', 'jarrow': 'United Kingdom', 'gympie': 'Australia', 'stockton': 'UNITED KINGDOM', 'alpbach': 'Austria', 'milwauke': 'United States', 'onalaksa': 'United States', 'zavyalovo': 'Russia', 'novotroitsk': 'Russia', 'suwanee': 'United States', 'el cerrito': 'United States of America', 'bluffdale': 'United States', 'heckmondwike': 'UNITED KINGDOM', 'turpan': 'China', 'banchory': 'United Kingdom', 'alvin': 'United States', 'russellville': 'United States', 'boones mill': 'United States', 'maracaibo': 'VENEZUELA', 'boshan': 'CHINA', 'nyon': 'Switzerland', 'caterham': 'UNITED KINGDOM', 'fond du lac': 'United States', 'yevpatoria': 'Ukraine', 'city shennan': 'China', 'peiraias': 'Greece', 'qinhuangdao shi': 'China', 'kfar sir': 'LEBANON', 'canfield': 'United States', 'bloomfield': 'United States', 'bolkhov': 'Russian Federation', 'mt. sidney': 'United States', 'yanji city': 'CHINA', 'daytona beach': 'United States', 'cagus': 'Puerto Rico', 'hortolândia': 'Brazil', 'providence': 'United States', 'duluth': 'United States', 'zhoushan ocean science city': 'China', 'baidoa bay': 'Somalia', 'haiyang city': 'CHINA', 'rizal': 'PHILIPPINES', 'alamosa': 'United States', 'ellesmere': 'UNITED KINGDOM', 'willebroek': 'BELGIUM', 'tulkarm': 'PALESTINE (WEST BANK-GAZA)', 'yabrood': 'Syria', 'orpington,': 'United Kingdom', 'vlasikha': 'Russia', 'warfield': 'United States', 'jazira al-khamisa': 'SYRIA', 'sebastian': 'United States', 'jingzhou city': 'China', 'opa-locka': 'United States', 'horn': 'SWITZERLAND', 'kyukphu township': 'MYANMAR', 'delmas': 'Haiti', 'chetek': 'United States', 'cheremkhovo': 'Russia', 'hissar rayon': 'Tajikistan', 'demyansk': 'Russia', 'murmansk oblast': 'Russia', 'kab. medan belawan': 'Indonesia', 'koch': 'South Sudan', 'tumushke': 'China', 'dzerzhinskiy': 'Russia', 'swords creek': 'United States', 'kota tinggi': 'Malaysia', 'elbow lake': 'United States', 'le paquier': 'Switzerland', 'bathhurst': 'CANADA', 'asmara': 'Eritrea'}
+# Additional normalizations that can't be expressed in the dict literal above
+COUNTRY_NORMALIZE.update({
+    "democratic people's republic of korea": "North Korea",
+    "democratic people's republic of korea (dprk)": "North Korea",
+    "korea, democratic people's republic of": "North Korea",
+    "people's democratic republic of korea": "North Korea",
+})
 
-def protect_saint(s: str) -> str:
-    s = norm_ws(s)
-    if not s:
-        return s
-    return SAINT_FIX_RE.sub(lambda m: "Saint " + m.group(1).title(), s)
+def normalize_country(c):
+    c = c.strip()
+    if not c: return c
+    if c.upper() == c and len(c) > 2:
+        c = c.title()
+    # Direct lookup first
+    result = COUNTRY_NORMALIZE.get(c.lower())
+    if result: return result
+    # Multi-country string (comma or semicolon separated): pick first known country
+    if ',' in c or ';' in c:
+        sep = ';' if ';' in c else ','
+        for part in c.split(sep):
+            part = part.strip()
+            r = COUNTRY_NORMALIZE.get(part.lower())
+            if r: return r
+            # Try COUNTRY_RE fullmatch
+            if COUNTRY_RE.search(part) and re.fullmatch(COUNTRY_RE.pattern, part, re.I):
+                return part  # return as-is, COUNTRY_TO_CODE will handle it
+    return c
 
+def get_country_code(country):
+    return COUNTRY_TO_CODE.get(country.lower().strip(), '')
 
-def strip_admin_noise(s: str) -> str:
-    s = norm_ws(s)
-    if not s:
-        return s
-    return ADMIN_NOISE_RE.sub("", s).strip(" ,;")
-
-
-def extract_locality_from_address1(addr1: str) -> Tuple[str, str]:
-    """Extract locality and remainder from ADDRESS1 for patterns like:
-       'CITY. IMISHLI, REPUBLIC OF AZERBAIJAN;'
-       'VILL. CHORKUKH, ISFARA DISTRICT, ...;'
+def parse_city_field(cty):
+    """Split CITY field into (city, state, addr3).
+    Rules learned from 11,000+ Raw→Cleaned reference examples.
     """
-    s = protect_saint(addr1)
-    if not s:
-        return "", ""
+    if not cty: return '', '', ''
+    s = cty.strip()
 
-    s2 = PREFIX_LOCALITY_RE.sub("", s.strip())
-    parts = re.split(r"[;,]\s*", s2, maxsplit=1)
-    loc = parts[0].strip(" ,;")
-    rem = parts[1].strip() if len(parts) > 1 else ""
+    def _is_township(p):
+        """Returns True if p is a Township/Borough/Parish phrase that belongs in ADDRESS3."""
+        return bool(re.search(r'\bTownship\b', p, re.I))
 
-    # avoid junk tokens becoming city
-    if safe_upper(loc) in JUNK_CITY:
-        loc = ""
+    def _is_state(p):
+        p_lower = p.lower()
+        p_stripped = re.sub(r'\s+(Province|Oblast|Krai|Region|Prefecture)$','',p,flags=re.I).strip().lower()
+        return bool(STATE_KW.search(p) or p_lower in KNOWN_STATES or p_stripped in KNOWN_STATES)
 
-    loc = strip_admin_noise(loc)
-    rem = strip_admin_noise(rem)
-    return loc, rem
+    def _is_country(p):
+        return bool(COUNTRY_RE.search(p) and re.fullmatch(COUNTRY_RE.pattern, p.strip(), re.I))
 
+    # No-comma: split at state keyword boundary e.g. "Guangzhou city Guangdong province"
+    if ',' not in s:
+        m = STATE_KW.search(s)
+        if m:
+            before = s[:m.start()].strip()
+            # If STATE_KW is at the END → usually whole string is state/district
+            # BUT if the word immediately before the keyword is a known place name,
+            # split: city = text before that word, state = known_place + keyword
+            # e.g. 'Guangzhou city Guangdong province' → city='Guangzhou city', state='Guangdong province'
+            # e.g. 'South Okkalapa Township' → city='', addr3='South Okkalapa Township'
+            if m.end() >= len(s.rstrip()):
+                # Township/Borough/Parish → goes to ADDRESS3, not state
+                if _is_township(s):
+                    return '', '', s
+                last_word = before.split()[-1].lower() if before.split() else ''
+                if last_word and (last_word in KNOWN_STATES or last_word in CITY_TO_COUNTRY):
+                    # Split before the known place name
+                    split_pos = before.lower().rfind(last_word)
+                    city_part = before[:split_pos].strip()
+                    state_part = s[split_pos:].strip()
+                    return city_part, state_part, ''
+                return '', s, ''
+            # STATE_KW in middle: text after keyword = city
+            # e.g. 'Sanchuang Township Yangon' → addr3='Sanchuang Township', city='Yangon'
+            after = s[m.end():].strip()
+            if after and not STATE_KW.search(after):
+                state_or_addr3 = s[:m.end()].strip()
+                if _is_township(state_or_addr3):
+                    return after, '', state_or_addr3
+                return after, state_or_addr3, ''
+            # STATE_KW at end with multi-word prefix: split at last space before keyword
+            # e.g. 'Guangzhou city Guangdong province' → city='Guangzhou city', state='Guangdong province'
+            last_sp = before.rfind(' ')
+            if last_sp > 0:
+                return before[:last_sp].strip(), s[last_sp+1:].strip(), ''
+        return s, '', ''
 
-def detect_country_from_text(text: str) -> Tuple[str, str]:
-    """Return (iso2, country_name) if explicitly mentioned in text."""
-    if not text:
-        return "", ""
-    for pat, iso2, name in EXPLICIT_COUNTRY_HINTS:
-        if pat.search(text):
-            return iso2, name
-    return "", ""
+    # Comma-separated
+    parts = [p.strip() for p in s.split(',') if p.strip()]
+    region_idx    = set()
+    country_idx   = set()
+    township_idx  = set()
+    for i, p in enumerate(parts):
+        if _is_country(p):   country_idx.add(i)
+        elif _is_township(p): township_idx.add(i)
+        elif _is_state(p):   region_idx.add(i)
 
+    other = [parts[i] for i in range(len(parts))
+             if i not in region_idx and i not in country_idx and i not in township_idx]
 
-def normalize_country(country_id: str, country: str) -> Tuple[str, str]:
-    cid = norm_ws(country_id).upper()
-    cname = strip_admin_noise(country)
+    # Handle pure-township parts that were separated above
+    if not other and township_idx:
+        # Township(s) with no city — township goes to addr3
+        twn_parts = [parts[i] for i in sorted(township_idx)]
+        st_parts  = [parts[i] for i in sorted(region_idx)]
+        city = next((p for p in st_parts if not STATE_KW.search(p) and p.lower() in CITY_TO_COUNTRY), '')
+        if city: st_parts = [p for p in st_parts if p != city]
+        return city, ', '.join(st_parts), ', '.join(twn_parts)
 
-    if cname and not cid:
-        cid = COUNTRY_NAME_TO_ISO2.get(cname.lower(), "")
+    if not other:
+        # All parts classified as state — pick the part without a STATE_KW keyword as city
+        # (e.g. 'Hlaing Township, Yangon': Yangon has no STATE_KW, Hlaing Township does)
+        non_kw = [parts[i] for i in sorted(region_idx) if not STATE_KW.search(parts[i])]
+        kw     = [parts[i] for i in sorted(region_idx) if STATE_KW.search(parts[i])]
+        if non_kw:
+            # Prefer CITY_TO_COUNTRY hit among non-kw parts
+            city = next((p for p in non_kw if p.lower() in CITY_TO_COUNTRY), non_kw[0])
+            state_parts = [p for p in kw if p.lower() != city.lower()]
+            state_parts += [p for p in non_kw if p != city]
+            return city, ', '.join(state_parts), ''
+        # All parts have STATE_KW — treat first as state, second as city if it exists
+        city = parts[0]
+        remaining = [parts[i] for i in range(1,len(parts)) if i not in country_idx]
+        return city, ', '.join(remaining), ''
 
-    if cid and not cname:
-        cname = ISO2_TO_COUNTRY.get(cid, "")
+    city = other[0]
+    for p in other:
+        if p.lower() in CITY_TO_COUNTRY: city = p; break
 
-    # last cleanup
-    cname = strip_admin_noise(cname)
-    return cid, cname
-
-
-def validate_postal(postal: str, country_id: str) -> str:
-    p = norm_ws(postal)
-    if not p:
-        return "MISSING"
-    cid = norm_ws(country_id).upper()
-    if cid in POSTAL_RE:
-        return "VALID" if POSTAL_RE[cid].match(p) else "INVALID"
-    return "UNKNOWN"
-
-
-def data_quality(addr1: str, addr2: str, city: str, country: str) -> str:
-    addr_present = bool(norm_ws(addr1) or norm_ws(addr2))
-    city_present = bool(norm_ws(city))
-    ctry_present = bool(norm_ws(country))
-    score = sum([addr_present, city_present, ctry_present])
-    if score == 3:
-        return "COMPLETE"
-    if score == 0:
-        return "MISSING"
-    return "PARTIAL"
-
-
-def clean_row(row: Dict, colmap: Dict[str, str]) -> Tuple[Dict, List[Tuple[str, str, str]]]:
-    """Clean a single row (dict). Returns updated row and list of field-level changes."""
-
-    def get(col_key: str) -> str:
-        col = colmap.get(col_key, col_key)
-        return row.get(col, "")
-
-    changes: List[Tuple[str, str, str]] = []
-
-    # pull
-    addr1 = protect_saint(get("ADDRESS1"))
-    addr2 = protect_saint(get("ADDRESS2"))
-    city = protect_saint(get("CITY"))
-    state = norm_ws(get("STATE"))
-    country = strip_admin_noise(get("COUNTRY"))
-    country_id = norm_ws(get("COUNTRY_ID")).upper()
-    postal = norm_ws(get("POSTAL"))
-
-    # 1) extract city from address1 if city missing
-    loc, rem = extract_locality_from_address1(addr1)
-    if not city and loc:
-        city = loc
-        if rem:
-            addr1 = rem
-
-    # 2) admin noise cleanup
-    city = strip_admin_noise(city)
-    addr1 = strip_admin_noise(addr1)
-
-    # 3) country resolution
-    combined = " ".join([addr1, addr2, city, state, country, country_id]).strip()
-
-    # Ambiguity override (Odessa)
-    if city.lower() in AMBIG_CITY_OVERRIDES:
-        pat, iso2o, nameo = AMBIG_CITY_OVERRIDES[city.lower()]
-        if pat.search(combined):
-            country_id, country = iso2o, nameo
-
-    # Explicit country wins
-    if not country_id or not country:
-        iso2, name = detect_country_from_text(combined)
-        if iso2:
-            country_id, country = iso2, name
-
-    # Normalize
-    country_id, country = normalize_country(country_id, country)
-
-    # 4) postal flag & data quality
-    postal_flag = validate_postal(postal, country_id)
-    dq = data_quality(addr1, addr2, city, country)
-
-    # write & track changes
-    def commit(key, value):
-        col = colmap.get(key, key)
-        before = "" if row.get(col, "") is None else str(row.get(col, ""))
-        after = "" if value is None else str(value)
-        if before != after:
-            changes.append((col, before, after))
-        row[col] = value
-
-    commit("ADDRESS1", addr1)
-    commit("ADDRESS2", addr2)
-    commit("CITY", city)
-    commit("STATE", state)
-    commit("COUNTRY_ID", country_id)
-    commit("COUNTRY", country)
-    commit("POSTAL", postal)
-
-    # Add computed fields if missing
-    if "POSTAL_FLAG" not in row:
-        row["POSTAL_FLAG"] = ""
-    if "DATA_QUALITY" not in row:
-        row["DATA_QUALITY"] = ""
-
-    commit("POSTAL_FLAG", postal_flag)
-    commit("DATA_QUALITY", dq)
-
-    return row, changes
+    state_parts    = [parts[i] for i in sorted(region_idx) if parts[i].lower() != city.lower()]
+    township_parts = [parts[i] for i in sorted(township_idx)]
+    addr3_parts    = [p for p in other if p != city] + township_parts
+    return city, ', '.join(state_parts), ', '.join(addr3_parts)
 
 
-def build_default_colmap(df: pd.DataFrame) -> Dict[str, str]:
-    """Try to map expected keys to actual columns."""
-    cols = list(df.columns)
-    u = {c.upper(): c for c in cols}
+def extract_from_address1(a1, ex_city='', ex_postal='', ex_country=''):
+    """
+    THE RULE (learned from 200+ Raw/Cleaned examples):
+    For each comma-separated part, strip from the RIGHT:
+      Country → Postal → City (always just the last 1 word)
+    Everything before stays in ADDRESS1.
+    District/neighbourhood before city STAYS in ADDRESS1 — never moves to CITY.
+    Does NOT expand abbreviations.
+    """
+    if not a1: return a1, ex_city, ex_postal, ex_country, '', ''
+    city=ex_city.strip(); postal=ex_postal.strip(); country=ex_country.strip(); a2_add=''
 
-    def pick(*names):
-        for n in names:
-            if n in u:
-                return u[n]
-        return ""
+    # Strip CITY./VILL./TOWN. type-prefix from the whole A1 string
+    _PLACE_TYPE_RE = re.compile(
+        r'^(?:CITY|VILL?|TOWN|STN|VLG|PGT|DP|SELO|DEREVNYA|AULL?|KISHLAK|AYMAK)[\. ]+\s*', re.I)
+    _a1_stripped = _PLACE_TYPE_RE.sub('', a1).strip()
+    if _a1_stripped and _a1_stripped != a1:
+        a1 = _a1_stripped
+    # FIX: Strip trailing semicolons/commas left by source data (e.g. "BRYANSK;")
+    a1 = re.sub(r'[;,]+\s*$', '', a1).strip()
 
-    mapping = {
-        "ADDRESS1": pick("ADDRESS1", "ADDRESS_1", "ADDR1"),
-        "ADDRESS2": pick("ADDRESS2", "ADDRESS_2", "ADDR2"),
-        "CITY": pick("CITY", "TOWN"),
-        "STATE": pick("STATE", "PROVINCE", "REGION"),
-        "POSTAL": pick("POSTAL", "ZIP", "POSTCODE"),
-        "COUNTRY": pick("COUNTRY"),
-        "COUNTRY_ID": pick("COUNTRY_ID", "COUNTRYCODE", "COUNTRY_CODE"),
-        "POSTAL_FLAG": "POSTAL_FLAG",
-        "DATA_QUALITY": "DATA_QUALITY",
+
+    # Parenthesised country: '(Syria)' → country only, clear A1
+    _paren_m = re.match(r'^\(([^)]+)\)\s*$', a1)
+    if _paren_m:
+        _cand = _paren_m.group(1).strip()
+        if COUNTRY_RE.search(_cand) and re.fullmatch(COUNTRY_RE.pattern, _cand, re.I):
+            if not country: country = _cand
+            return '', city, postal, country, '', ''
+
+    # Annotation-only address: 'Iraq (possible alternative location as at Mar 2024)'
+    # Extract the country and discard the annotation text
+    _annot_m = re.match(
+        r'^([A-Z][A-Za-z\s]+?)\s*(?:\((?:possible|alternative|as at|location|circa|approx)'
+        r'|\bas at\b|\bpossible\b|\balternative location\b)',
+        a1, re.I)
+    if _annot_m:
+        _cand = _annot_m.group(1).strip()
+        if (COUNTRY_RE.search(_cand) and
+                re.fullmatch(COUNTRY_RE.pattern, _cand, re.I)):
+            if not country: country = _cand
+            return '', city, postal, country, '', ''
+
+    # Quick check: no-comma 'Street HouseNo PostalCode City' pattern
+    # e.g. 'Bahnhofplatz 2 8001 Zurich' → A1='Bahnhofplatz 2', postal='8001', city='Zurich'
+    if ',' not in a1 and not postal and not city:
+        _spc = re.search(
+            r'^(.+?)\s+(\d{4,5})\s+([A-ZÀ-ɏ][A-Za-zÀ-ɏ\u00C0-\u024F][A-Za-zÀ-ɏ\u00C0-\u024F\s\-]*)\s*$',
+            a1)
+        if _spc:
+            _st, _ps, _ct = _spc.group(1).strip(), _spc.group(2), _spc.group(3).strip()
+            _ends_num = bool(re.search(r'\d$', _st))
+            _has_addr = bool(ADDR_RE.search(_st))
+            if (_ends_num or _has_addr) and _ct.lower() in CITY_TO_COUNTRY:
+                return _st, _ct, _ps, normalize_country(CITY_TO_COUNTRY[_ct.lower()]), '', ''
+
+    parts=[p.strip() for p in a1.split(',') if p.strip()]
+    street_parts=[]
+
+    def is_city_part(part):
+        """Short standalone part that is just a city name (not a phrase or country)."""
+        p=part.strip()
+        if not p or ADDR_RE.search(p) or re.match(r'^\d',p): return False
+        if COUNTRY_RE.search(p): return False
+        if ISO2_RE.match(p) and p in ISO_TO_COUNTRY: return False
+        # Exclude unit/floor codes like G03, B12, F01 (letter + digits)
+        if re.match(r'^[A-Z]\d{1,4}[A-Z]?$', p, re.I): return False
+        # Exclude province/state/district names (they are never cities)
+        if STATE_KW.search(p): return False
+        words=p.split()
+        if len(words)>2: return False
+        return bool(re.match(r'^[A-ZÀ-ɏ]',p) and len(p)<40)
+
+    def has_geo(part):
+        # Only flag country-as-geo if country word is at the END or IS the whole part
+        # (prevents "China Resources Logistics" triggering via the word "China")
+        cou_at_end=bool(re.search(r'(?:^|\s)('+COUNTRY_RE.pattern+r')\s*$',part,re.I))
+        return (cou_at_end or
+                bool(re.search(r'\d{4,7}\s*$',part)) or
+                bool(ISO2_RE.match(part.strip()) and part.strip() in ISO_TO_COUNTRY))
+
+    def strip_tail(s, c='', p='', co='', a2=''):
+        """Strip Country/Postal/City from right end. Returns (street, city, postal, country)."""
+        # Handle whole string = country name (e.g. "Turkey." or "Russia")
+        s_stripped = s.strip().rstrip('.,')
+        if re.fullmatch(COUNTRY_RE.pattern, s_stripped, re.I):
+            if not co: co = s_stripped
+            return '', c, p, co, a2
+
+        _postal_district_found=False  # set here so it's always defined
+        # Country+Postal together: "Turkey 34758" or "Russia 119071"
+        mc_p=re.search(r'\s+('+COUNTRY_RE.pattern+r')\s+(\d{4,7})\s*$',s,re.I)
+        if mc_p:
+            if not co: co=mc_p.group(1)
+            if not p:  p=mc_p.group(mc_p.lastindex)
+            s=s[:mc_p.start()].strip()
+        else:
+            # ISO at end
+            iso_m=re.search(r'\s+([A-Z]{2})\s*$',s)
+            if iso_m and iso_m.group(1) in ISO_TO_COUNTRY and iso_m.group(1) not in ('No','D'):
+                if not co: co=ISO_TO_COUNTRY[iso_m.group(1)]
+                s=s[:iso_m.start()].strip()
+            else:
+                # Country alone at end
+                mc=re.search(r'\s+('+COUNTRY_RE.pattern+r')\s*$',s,re.I)
+                if mc:
+                    if not co: co=mc.group(1)
+                    s=s[:mc.start()].strip()
+            # Postal alone at end, or "Postal District" at end
+            # e.g. "...Cybercity 72201 Ebene" → postal=72201, a2='Ebene'
+            m_pd=re.search(r'\s+(\d{4,7})\.?\d*\s+([A-Z][a-z]+)\s*$',s)
+            if m_pd and not re.match(r'^\d',s):
+                if not p: p=m_pd.group(1)
+                # Word after postal = city if known, else address2 (district/suburb)
+                _pd_word = m_pd.group(2)
+                if _pd_word.lower() in CITY_TO_COUNTRY:
+                    if not c: c = _pd_word  # known city → treat as city, not district
+                else:
+                    if not a2: a2 = _pd_word
+                s=s[:m_pd.start()].strip()
+                _postal_district_found=True
+            else:
+                # UK postcode at end (e.g. 'EC3A 8BF', 'BD7 1NX')
+                uk_m=UK_POST_RE.search(s)
+                uk_str=uk_m.group(1).replace(' ','').upper() if uk_m else ''
+                if uk_m and s.replace(' ','').upper().endswith(uk_str):
+                    if not p: p=uk_m.group(1)
+                    s=s[:uk_m.start()].strip()  # use match position, not rfind
+                    # s may now be a country name (e.g. 'SCOTLAND')
+                    s_stripped=s.strip().rstrip('.,')
+                    if re.fullmatch(COUNTRY_RE.pattern,s_stripped,re.I):
+                        if not co: co=s_stripped
+                        s=''
+                else:
+                    mp=re.search(r'\s+(\d{4,7})\.?\d*\s*$',s)
+                    if mp:
+                        if not p: p=re.sub(r'\.0+$','',mp.group(1))
+                        s=s[:mp.start()].strip()
+        # Handle 'REPUBLIC OF <word>' at end as country indicator
+        if s and not co:
+            _r_m = re.search(r'\s*\bREPUBLIC\s+OF\s+(\w[\w\s\-]*)$', s, re.I)
+            if _r_m:
+                _r_cand = 'Republic of ' + _r_m.group(1).strip().title()
+                _r_norm = COUNTRY_NORMALIZE.get(_r_cand.lower(), '')
+                if _r_norm and COUNTRY_TO_CODE.get(_r_norm.lower(), ''):
+                    co = _r_norm
+                    s = s[:_r_m.start()].strip()
+                    # Also strip 'OF THE' before REPUBLIC OF
+                    s = re.sub(r'\s*\bOF\s+THE\s*$', '', s, flags=re.I).strip()
+
+        # Strip orphaned 'REPUBLIC OF' / 'OF THE REPUBLIC OF' from end of s
+        if s and co:
+            s = re.sub(r'\s*\bOF\s+THE\s+REPUBLIC\s+OF\s*$', '', s, flags=re.I).strip()
+            s = re.sub(r'\s*\bREPUBLIC\s+OF\s*$', '', s, flags=re.I).strip()
+            s = re.sub(r'\s*\bOF\s+THE\s*$', '', s, flags=re.I).strip()
+
+        # Second-pass: strip any remaining country/region word at end
+        # e.g. '35 Stonald Road Whittlesey England' after 'United Kingdom' stripped
+        if s and not c:
+            mc2=re.search(r'\s+('+COUNTRY_RE.pattern+r')\s*$',s,re.I)
+            if mc2 and not co:
+                # Only strip if it looks like a sub-national region (England, Scotland)
+                # or if co was already set (it's redundant region info)
+                co2_cand=mc2.group(1)
+                if co or re.fullmatch(COUNTRY_RE.pattern, co2_cand, re.I):
+                    if not co: co=co2_cand
+                    s=s[:mc2.start()].strip()
+            elif mc2 and co:
+                s=s[:mc2.start()].strip()
+        # Street-Postal-City: detect 'Bahnhofplatz 2 8001 Zurich' style (no commas)
+        # Pattern: ...StreetWords... PostalCode CityName
+        if not p and not c:
+            _spc_m = re.search(
+                r'^(.+?)\s+(\d{4,5})\s+([A-ZÀ-ɏ][A-Za-zÀ-ɏ\u00C0-\u024F\-\s]+)$', s)
+            if _spc_m:
+                _st = _spc_m.group(1).strip()
+                _ps = _spc_m.group(2)
+                _ct = _spc_m.group(3).strip()
+                _has_kw  = bool(ADDR_RE.search(_st))
+                _ends_num = bool(re.search(r'\d$', _st))
+                _city_known = _ct.lower() in CITY_TO_COUNTRY
+                if (_has_kw or _ends_num) and _city_known:
+                    s = _st; p = _ps; c = _ct
+
+        # City: last 1 word — but skip if postal+district already handled end of address
+        # (e.g. '72201 Ebene' already accounts for the address tail)
+        if _postal_district_found:
+            return s,c,p,co,a2
+        # US address pattern: strip state abbreviation then extract city
+        if not c and p and s:
+            words_tmp=s.split()
+            last_tmp=words_tmp[-1].upper() if words_tmp else ''
+            if last_tmp in US_STATE_EXPAND:
+                # Strip state abbrev, then find city after last street keyword
+                s_no_state=' '.join(words_tmp[:-1]).strip()
+                state_full=US_STATE_EXPAND[last_tmp]
+                if not co: co='United States'
+                # Find last street keyword to split street / city
+                ws=s_no_state.split()
+                last_kw=-1
+                for ki,kw in enumerate(ws):
+                    if ADDR_RE.search(kw): last_kw=ki
+                if last_kw>=0:
+                    after_kw=ws[last_kw+1:]
+                    city_start=0
+                    for ji,jw in enumerate(after_kw):
+                        if re.match(r'^\d',jw): city_start=ji+1
+                        else: break
+                    s=' '.join(ws[:last_kw+1+city_start])
+                    c=' '.join(after_kw[city_start:])
+                else:
+                    s=s_no_state
+                return s,c,p,co,a2
+        words=s.split()
+        if len(words)==1:
+            w=words[0]
+            if (re.match(r'^[A-ZÀ-ɏ]',w) and not re.match(r'^\d',w)
+                    and not COUNTRY_RE.match(w) and not ADDR_RE.search(w)
+                    and not STATE_KW.search(w)
+                    and not re.match(r'^[A-Z]\d{1,4}[A-Z]?$',w,re.I)
+                    and len(w)>1):
+                if not c: c=w
+                s=''  # always clear — single remaining word = city, not street
+        elif len(words)>=2 and not c:
+                for n in [4,3,2]:
+                    if len(words)>=n:
+                        cand=' '.join(words[-n:]).lower()
+                        if cand in MULTIWORD_CITIES:
+                            c=' '.join(words[-n:]); s=' '.join(words[:-n]).strip()
+                            break
+                if not c:
+                    last=words[-1]
+                    rest_of_s=' '.join(words[:-1])
+                    # Don't strip if the word already appears earlier (e.g. 'Ebene' in '9th Floor Ebene Tower Cybercity Ebene')
+                    already_present=last.lower() in rest_of_s.lower()
+                    if (re.match(r'^[A-ZÀ-ɏ]',last) and not re.match(r'^\d',last)
+                            and not COUNTRY_RE.match(last) and not ADDR_RE.search(last)
+                            and not STATE_KW.search(last)
+                            and not re.match(r'^[A-Z]\d{1,4}[A-Z]?$',last,re.I)
+                            and len(last)>1 and not already_present):
+                        c=last; s=rest_of_s.strip()
+        # After city extraction, check again for postal (numeric or UK) at end of s
+        if not p and s:
+            mp2=re.search(r'\s+(\d{4,6})\s*$',s)
+            if mp2:
+                p=mp2.group(1); s=s[:mp2.start()].strip()
+            else:
+                # UK postcode may now be at end after city was stripped
+                uk2=UK_POST_RE.search(s)
+                if uk2 and s.replace(' ','').upper().endswith(uk2.group(1).replace(' ','').upper()):
+                    p=uk2.group(1); s=s[:uk2.start()].strip()
+
+        # City n-gram scan: if no city found yet, scan remaining s for known multi-word city
+        # e.g. 'Verkhnyaya Pyshma' inside '1 Verkhnyaya Pyshma Sverdlovsk Region'
+        if not c and s:
+            _sw = s.split()
+            _found = False
+            for _n in range(min(4, len(_sw)), 0, -1):
+                if _found: break
+                for _i in range(len(_sw)-_n+1):
+                    _cand = ' '.join(_sw[_i:_i+_n])
+                    _cl   = _cand.lower()
+                    if ((_cl in MULTIWORD_CITIES or _cl in CITY_TO_COUNTRY)
+                            and not STATE_KW.search(_cand)
+                            and not any(_w.lower() in KNOWN_STATES for _w in _sw[_i:_i+_n])):
+                        c = _cand
+                        _remaining_words = _sw[:_i] + _sw[_i+_n:]
+                        # Extract state phrase from remaining words (words with STATE_KW)
+                        if not a2 and _remaining_words:
+                            _km = STATE_KW.search(' '.join(_remaining_words))
+                            if _km:
+                                _rw = ' '.join(_remaining_words)
+                                _sp = _rw.rfind(' ', 0, _km.start())  # pos before state keyword
+                                _state_start = max(0, _rw.rfind(' ', 0, _sp)+1) if _sp > 0 else 0
+                                _state_phrase = _rw[_state_start:].strip()
+                                # Only use as state if it looks like a real state phrase
+                                if _state_phrase and not ADDR_RE.search(_state_phrase):
+                                    a2 = _state_phrase
+                                    _remaining_words = _rw[:_state_start].split()
+                        s = ' '.join(_remaining_words).strip()
+                        _found = True; break
+
+        return s,c,p,co,a2
+
+    MULTIWORD_CITIES={'minh city', 'honghu city', 'morehead city', 'hartford city', 'méxico d.f.', 'hami city', 'ellicott city', 'shenzhen city', 'baton rouge', 'enshi city', 'yantai city', 'yelabuga municipality', 'wan chai', 'yuzhno sukhokumsk', 'zeribat el oued', 'cedar hill', 'laguna beach', 'shangcheng town', 'center quetta', 'east hartford', 'st. petersburg', 'sergiev posad-6', 'los mochis', 'manzal tmim', 'new orleans', 'hochiminh city', 'welwyn garden city', 'saint charles', 'haren (ems)', 'zhuzhou hunan', 'little rock', 'pleasant prairie', 'new canaan', 'north shields', 'al hudaydah', 'tengzhou city', 'north little rock', 'blaydon on tyne', 'salt lake city', 'leicester city', 'naberezhnyye chelny', 'litchfield park', 'downham market', 'luzhou city', 'new paltz', 'bayou la batre', 'bama town', 'lees summit', 'lingbao city', 'sydney cbd', 'city of kaliningrad', 'g. novosibirsk', 'white stone', 'craven arms', 'shijiazhuang city', 'new britain', 'la puente', 'changji city', 'bahan township', 'bonita springs', 'city of sofia', 'jiangmen city', 'las vega', 'new haven', 'novyy urengoy', 'damascus countryside', 'castle rock', 'north haven', 'tumushuk city', 'north andover', 'xiamen city', 'newcastle upon tyne', 'newton abbot', 'subang jaya', 'mount airy', 'simi valley', 'new hyde park', 'palos hills', 'ryazan city', 'lake oswego', 'staryy oskol', 'san miguel de abona', 'rocky gap', 'worcester park', 'mt. jackson', 'greenwood village', 'moscow mills', 'el monte', 'zhaoqing city', 'changchun city', 'gus khrustalnyy', 'lytham st annes', "qian 'an city", 'maoming city', 'tangerang selatan', 'st albans', 'lenoir city', 'jingzhou city', 'al hadath', 'calhoun city', 'town tortola', 'great yarmouth', 'sanming city', 'bishop auckland', 'panabo davao city', 'santa cruz', 'ningbo city', 'pelabuhan klang', 'island park', 'nasr city, cairo', 'south hero', 'stockton on tees', 'poplar bluff', 'saint john', 'yining city', 'yulin shi', 'mexico city', 'can tho city', 'city of industry', 'johor bahru', 'mudanjiang city', 'city saveh', 'pune city', 'sanaa yemen', 'phû lý', 'wilayah persekutuan kuala lumpur', 'jining city', 'culver city', 'st leonards-on-sea', 'santa cruz de l sierra', 'jaya petaling jaya', 'las vegas', 'west kirby', 'dingzhou city', 'saint-quentin-en-yvelines cedex', 'banda aceh', 'nizhny arkhyz', 'mytishchi city', 'rocky mount', 'bogota dc', 'rogachev city', 'south ogden', 'greater manchester', 'cebu city', 'cradley heath', 'deerfield beach', "ya'an city", 'ar riyadh', 'west melbourne', 'xiangtan city', 'al rastan', 'yibin city', 'bandar seri begawan', 'baldwin park', 'johar bahru', 'az zabadan', 'jinzhou shi', 'cape coral', 'atlantic city', 'nuevo laredo', "king's lynn", 'north waziristan', 'chia cundinamarca', 'vakaga prefecture', 'pingxiang city', 'ras al khaimah', 'north conway', 'waltham cross', 'wanzhong city', 'xinyang city', 'west charleston', 'al qounaitra', 'east rochester', 'naberezhny chelny', 'dzerzhinsk city', 'sumber agung magetan', 'sugar land', 'shuanghe city', 'karlovy vary', 'khatlon province', 'milton keynes', 'rostov on don', 'market drayton', 'temple hills', 'shiyan city', 'xianyang city', 'sergiyev posad', 'west mclean', 'aksu prefecture', 'qing city', 'burj al barajineh', 'prince george', 'la mirada', 'church road', 'piedras negras', 'silver spring', 'melbourne vic', 'southend on sea', 'am dafock', 'handan city', 'elmali mah', 'new dedlhi', 'rajshahi city', 'panjachel solola ca', 'wuxi shi', 'capitol heights', 'kashgar city', 'port loius', 'yelets (elets)', 'bint jbeil', 'san juan city', 'city yantai', 'thanh hoa city', 'bad saarow', 'monterey park', 'zunyi city', 'burj el-barajineh', 'jalal-abad region', 'yueyang city', 'ciudad de', 'shadogou town', 'xi’an city', 'hemel hempstead', 'mumbai city', 'saint peterburg', 'kaohsiung city', 'st. kamensk-uralsky', 'canon city', 'zibo city', 'kunming city', 'st basre', 'olive branch', 'west haven', 'hohhot city', 'bandar abbas', 'new brighton', 'bell gardens', 'lianyuan city', 'kowloon bay', 'king william', 'yancheng city', 'naucalpan de juarez', 'iowa city', 'haikou city', 'benxi city', 'medan belawan', 'thandwe city', 'yanji city', 'orchard hill', 'isfahan city', 'nanfaxin town', 'ruther glen', 'cannon falls', 'zheleznogorsk ilimski', 'saffron walden', 'hasbrouck heights', 'vero beach', 'haywards heath', 'tianzhuang town', 'miami beach', 'yushan town', 'hoffman estates', 'quanzhou city', 'west peoria', 'murray hill', 'perth amboy', 'chongzuo city', 'zhoukou city', 'the city of sevastopol', 'st mashhad', 'majuro republic', 'menlo park', 'kashgar area', 'inner mongolia', 'downers grove', 'nantong city', 'w. tyler', 'hub town', 'fergana city', 'mon state', 'city of edinburgh', 'chipping norton', 'north hempstead', 'cham city', 'danjiangkou city', 'tacheng city', 'wuyishan city', 'caloocan city', 'vologda 20', 'bandar nowshahr', 'north hollywood', 'el paso', 'port hueneme', 'yili kazakh autonomous prefecture', 'gaza strip', 'akesu city', 'east brunswick', 'north tazewell', 'atushi city', 'santa monica', 'new delhi', 'kizilsu kirgiz autonomous prefecture', 'mayangone township', 'stary gorodok', 'manassas park', 'são luís', 'nam dinh', 'majuro mh', 'city qazvin', 'south hill', 'donetsk city', 'naberezhnyye cheliny', 'north babylon', 'beaufort west', 'xiaogan city', 'dexing city', 'woodford green', 'hengshui city', 'songlindian town', 'north wilkesboro', 'almaty city', 'kab. kota malang', 'city of london', 'bullhead city', 'jakarta barat', 'college station', 'kota cirebon', 'suihua city', 'figueira da foz', 'sosnovy bor', 'tumshuq city', 'nha trang', 'kabi̇l i̇li̇', 'qods town', 'mandalay city', 'beverly hills', 'caba buenos aires', 'dar es salaam', 'new territories', 'islamabad urban', 'verkhniy ufaley', 'el hachiniia', 'kgs. lyngby', 'hammam - sousse', 'lake park', 'south okkalapa', 'colonial heights', 'new  york', 'los angele', 'santiago de', 'chifeng city', 'nanyang city', 'ciudad de guatemala', 'mountain lakes', 'tlajomulco de zúñiga', 'chengdu city', 'james store', 'vladivostok city', 'boca chica', 'west hollywood', 'myrtle beach', 'hong kong city', 'san pedro sula', 'bay city', 'naberezhnye chelny city', 'jiuquan city', 'south riding', 'al kharaj', 'palo alto', 'panabo city', 'west covina', 'jinchang city', 'la crosse', 'malang kora', 'stockton heath', 'chengmai county', 'gaza city', 'rockbridge baths', 'st. louis', 'pursat city', 'adm. jakarta selatan', 'ottawa lake', 'kashi city', 'st. leonards-on-sea', 'quetta city', 'wakaf bharu', 'chongqing city', 'road town', 'ciudad de méxico', 'jdeidet el', 'huaihua city', 'st peter port', 'khan dari', 'ras al-khaimah', 'naberezhnye chelny', 'bien hoa', 'selo alferovskoe', 'ft lauderdale', 'lahore city', 'albu kamal (al-bukamal)', 'bozhou city', 'anyang city', 'chevy chase', 'guiyang city', 'montero-santa cruz', 'south san francisco', 'little hulton', 'al sad el aaly dokhi', 'zhengzhou city', 'hlaing township', 'al bukamal', 'santa ana', 'the woodlands', 'western cape town', 'rocky hill', 'garden city', 'novaya lyalya', 'liaoyang city', 'surat thani', 'bayingolin mongol autonomous prefecture', 'hi-tech industrial development zone', 'johnson city', 'fall rivers', 'shuangyashan city', 'depok city', 'shihezi city', 'sverdlovsk oblast', 'des plaines', 'changli county', 'ft. lauderdale', 'bengbu city', 'grand prairie', 'ho chi minh city', 'bryson city', 'yichang city', 'yuba city', 'windsor locks', 'myawaddy township', 'burgess hill', 'novosibirsk academic city', 'midview city', 'shar-e kord', 'orekhovo - zuyevo', 'komsomolsk on amur', 'thị trấn lâm', 'mt. airy', 'port charlotte', 'gao’an city', 'huangshi shi', 'vung tau', 'baidoa bay', 'niagara falls', 'shahr-e kord', 'east orange', 'clifton forge', 'south shields', 'fushe kosove', 'round rock', 'xuancheng city', 'santa cruz de la sierra', 'hallandale beach', 'gereshk city', 'st louis', 'western cape', 'bandar seri begawan\u200b', 'north yarmouth', 'santa rosa', 'le spring', 'st julians', 'jane lew', 'oak ridge', 'tieling city', 'davao city', 'ganzhou city', 'altay city', 'san josé', '10th of ramadan city', 'victoria mahe', 'elizabeth city', 'locust grove', 'luxemburg city', 'port melbourne', 'midsomer norton', 'los olivos', 'rural retreat', 'deir al-balah', 'fo tan sha tin', 'hengshui, city', 'woolwich_x000d_\ntownship', 'phnom penh', 'el segundo', 'shan state', 'sumatera utara', 'chaohu shi', 'hebi city', 'xichang city', 'sandy hook', 'panzhihua city', 'jinzhong city', 'warner robins', 'east cowes', 'rajshahi mahanagor', 'hanoi city', 'nasr city', 'wake forest', 'los alamitos', 'guangzhou city', 'veliky novgorod', 'houghton le spring', 'lashkar gah', 'rochelle park', 'hong kong', 'city of st. pcity of st. petersburgetersburg', 'falls church', 'great sankey', 'shangqiu city', 'port said', 'kyzyl-kiya town', 'bortala mongolian autonomous prefecture', 'fort lauderdale', "mevo'ot yericho", 'ladys island', 'liaoning city', 'delegaci¢n miguel hidalgo', 'west fargo', 'al qasser', 'south ockendon', 'jalalabad nangarhar', 'little falls', 'daytona beach', 'central jakarta', 'burnham on sea', 'hangzhou shi', 'karamay city', 'kab. morowali', 'newcastle under lyme', 'khorramshahr city', 'gaoan city', 'stratford upon avon', 'la plata', 'glen allen', 'navi mumbai', 'fengdong new town', 'suisan city', 'chon buri', 'zamboanga şehri', 'al ghaydah', 'sowerby bridge', 'leshan city', 'rochester hills', 'yang city', 'st john', 'bognor regis', 'incheh borun', 'hilton head', 'taizhou shi', 'fernandina beach', 'villa nova de gaia', 'kota surakarta', 'dki jakarta', 'zhejiang province', 'guatemala city (cuidad de guatemala)', 'hamhung south', 'studio city', 'novo sarajevo', 'e rochester', 'abu dhabi', 'little egg harbor', 'washington twp', 'chicago heights', 'chapel hill', 'lampung bandar', 'cedar rapids', 'burton latimer', 'whitehouse station', 'bishkek city', 'tonghua city', 'huludao city', 'saint cloud', 'hilton head island', 'm. chișinău', 'south orange', 'selskoe poselenie kushalino', 'farmington hills', 'lushan city', 'wuhan city', '6th of october city', 'st laurent', 'spin boldak', 'stanitsa nezlobnaya', 'washington, d.c.', 'zhenjiang city', 'upper marlboro', 'pingquan city', 'st. helens', 'posyolok strelka', 'sergiev posad', 'st. austell', 'urumqi city', 'rabochiy posyolok svobodny', 'bojnord city', 'nanjing shi', 'ben arous', 'dayr az zawr', 'terre haute', 'abu ghurayb', 'staten island', 'highland village', 'south sutton', "gu'an county", 'yangzhou city', 'le paquier-montbarry', 'nizhniy tagil', 'unionville ontario', 'qu dalian', 'westlake village', 'chisinau town', 'beitun city', 'dianbai city', 'krong bavet', 'south prince george', 'white lake', 'langfang city', 'yuan guilin city', 'district islamabad', 'north ferriby', 'belize city', 'mineralnye vody', 'nihzny novgorod', 'colonial beach', 'myrtle bank', 'dezhou city', 'dzerzhinsk nizhny', 'makatai city', 'gegu town', 'yekaterinburg city', 'harbin city', 'foster city', 'charles city', 'el dorado', 'lahore ci̇ty', 'mecico city', 'ha noi', 'castleford west', 'cottonwood heights', 'diamond bar', 'pacific palisades', 'liaocheng city', 'donggang city', 'sun valley', 'mount cotton', 'south boardman', 'cape town', 'quetta şehri', 'south croydon', 'hefei city', 'suzhou city', 'chengdu shi', 'st. george', 'heyuan city', 'harrison township', 'holly springs', 'val d’oise', 'shwepyitha township', 'guangdong province', 'albu kamal', 'vladimir city', 'saint perstburg', 'lutherville timonium', 'ust-kamenogorsk city', 'wukang town', 'wujiaqu city', 'pyongyang city', 'san mateo', 'são luis', 'agrate brianza', 'san rafael', 'lanao del sur', 'xiazhuang town', 'san francisco', 'tinton falls', 'ili prefecture', 'panjin city', 'anadyr chukotka', 'kyaing tong', 'shijiao town', 'haret hreik', 'qingdao city', 'monte vista', 'providence forge', 'zhijiang city', 'pavlovskiy posad', 'quesnel bc', 'west drayton', 'guangshui city', 'alfas del pi', 'macheng city', 'verkhnyaya tura', 'nizhniy novgorod', 'shenliu town', 'san gwann', 'richmond hill', 'xianshuigu city', 'bandar assalouyeh', 'fairfax station', 'carson city', 'hu uaraz', 'west palm beach', 'santa venera', 'moscow city', 'st. gallen', 'san miguel', 'stony creek', 'qu xiamen', 'weyers cave', 'playas de rosarito', 'surrey, bc v4n 1j7', 'jiaxing city', 'pochtovoe otdelenie putilkovo', 'xinjiang uighur autonomous region', 'kota bekasi', 'los banos', 'lake forest', 'shantou shi', 'kota semarang', 'verkhnyaya pyshma', 'mountain ash', 'qinhan new city', 'xiakou town', 'hanover park', 'gun barrel city', 'costa mesa', 'sakarya adapazari', 'estado distrito capital', 'mandaluyong city', 'west wick', 'tarlac city', 'xianning city', 'baihou town', 'liuzhou city', 'rock hill', 'changji hui autonomous prefecture', 'knox city', 'boynton beach', 'bury st. edmunds', 'aleksin town', 'ixtlan de rio', 'staraya russa', 'tainan city', 'city shennan', 'phu ly city', 'guilin city', 'queen creek', 'taichung city', 'jdeidet el metn', 'kab. sukoharjo', 'north wildwood', 'nizhnie sergi', 'palm beach gardens', 'st. albans', 'grand rapids', 'long beach', 'bayingoleng mongolian autonomous prefecture', 'phû lý hà nam', 'saint petersburg', 'pulau pinang', 'akqi town', 'city panama', "bishop's stortford", 'shangluo city', 'gaza city region', 'yichun city', 'jurupa valley', 'ciudad del este', 'san clara', 'stanitsa medvedovskaya', 'north las vegas', 'kota malang', 'saint clair shores', 'north garden', 'vyshny volochyok', 'new oxford', 'ash shihr', 'sayda guba', 'tumushuke city', 'kyukphu township', 'richmond upon thames', 'longnan city', 'ras el matn', 'preah sihanouk city', 'baotou city', 'west kirkby', 'huanggang city', 'lake ridge', 'lanzhou city', 'sin el fil', 'phu ly', 'shizuishan city', 'north hills', 'chizhou city', 'clear brook', 'st helens', 'st. saint petersburg', 'long island city', 'forest town', 'haiyang city', 'zamboanga city', 'baiyin city', 'river falls', 'stanford le hope', 'meizhou city', 'zhangzhou city', 'herne bay', 'dushanbe city', 'michigan city', 'yicheng city', 'altay krai', 'kandahar şehri', 'beverley hills', 'umm salal', 'guigang city', 'south el monte', 'north kivu', 'rose bud', 'cagayan de oro', 'pennington gap', 'tsuen wan', 'vahdat city', 'hong linh', 'lviv city', 'kota tinggi', 'yuen long', 'rio bravo', 'ningde city', 'blue springs', 'deer park', 'puerto vallarta', 'derevnya lesnaya polyana', 'owings mills', 'aksu city', 'pingdingshan city', 'bukit antarabangsa', 'laguna hills', 'hacienda heights', 'frankfurt main', 'tehsil lahore city', 'tacheng area', 'lianyungang city', 'tunis tunisia', 'rosarito baja', 'cagayan de oro city', 'santa fe springs', 'west malling', 'new cairo', 'so holland', 'port gibson', 'columbia city', 'sungai udang', "st. john's", 'laohekou city', 'chiang rai', 'lehigh acres', 'mc lean', 'high point', 'al hasaka', 'campo de criptana', 'hebden bridge', 'pointe-à-la-croix quebec', 'seri kembangan', 'aleksandrow lodzki', 'qinzhou city', 'rostov na donu', 'far rockaway', 'raffles place', 'tysons corner', 'locust dale', 'spring grove', "tai'an city", 'west bromwich', 'osio sotto', 'forest lake', 'potters bar', 'fateh jang', 'staraya kupavna', 'newport news', 'defuniak springs', 'petropavlovsk kamchatski', 'preston lancashire', 'belo horizonte', 'thornridge city', 'san leandro', "xi 'an city", 'longkou city', 'guatemala city', 'new fairfield', 'union city', 'tongren city', 'al-najaf al-ashraf', 'subang jawa barat', 'poselok gorodskogo tipa urussu', 'qishan city', 'merthyr tydfil', 'st catharines', 'phar an township', 'manhattan beach', 'point richmond', 'suisun city', 'foshan shi', 'east london', 'the city of surgut', 'linfen city', 'live oak', 'la paz', 'beloozersky town', 'zhaodong city', 'wuwei city', 'moss point', 'goa velha', 'rongjiawan town', 'ciudad juarez', 'datong city', 'navoiy city', 'south dartmouth', 'glen rose', 'palm city', 'yong peng', 'meishan city', 'wenxing town', 'zhangshu city', 'el cerrito', 'ebbw vale', 'paya vista', 'colwyn bay', 'yingtan city', 'sterling heights', 'malang city', 'south lebanon', 'north humberside', 'chongqing cn', 'new tredegar', 'verkhnyaya salda', 'falcon heights', 'great oakley', 'high wycombe', 'usolye sibirskoye', 'south windsor', 'majalengka kulon', 'ajeltake island', 'la habra', 'shanghai city', 'gonbad kavoos', 'hod hasharon', 'oklahoma city', 'kota damansara', 'hubei province', 'nanching city', 'weihai city', 'town taksimo', 'jiaozuo city', 'ranchos palos verdes', 'santa rita', 'chengde city', 'chuxiong city', 'korla city', 'kabylie region', 'jilin city', 'kill devil hills', 'la canada', 'kfar kila', 'xian shi', 'hyde park', 'tega cay', 'vyatskie polyany', 'chuanshan town', 'sao cristovao', 'borj el amri', 'nizhnyaya tura', 'east moline', 'viby j.', 'sarajevo kanton', 'suzhou shi', 'leamington spa', 'velikiye luki', 'shishou city', 'cuidad juarez', 'deyang shi', 'chapala, jalisco 459', 'sankt petersborg', 'prior lake', 'al rayyan', "gao'an city", 'kab. medan belawan', 'pingliang city', 'renqiu city', "ji'an city", 'vladimiro-aleksandrovskoe selo', 'north judson', 'coral springs', 'yongzhou city', 'fort collins', 'changzhi city', 'hissar rayon', 'weifang city', 'north bergen', 'hotan area', 'jinghe new town', 'jinbian city', 'st port louis', 'gammarth supérieur', 'al suqaylabiya', 'new bedford', 'heze city', 'suizhou city', 'jinhua city', 'gulistan town', 'montgomery park', 'east chicago', 'mira loma', 'virginia beach', 'baldones novads', 'moscow oblast', 'myakka city', 'tehran city', 'st. blazey', 'velikiy novgorod', 'sepahan city', 'xinjiang uygur autonomous region', 'danyang city', 'agios athanasios', 'shah alam', 'zhangjiakou city', 'st petersburg', 'bury st edmunds', 'fort wayne', 'anguo city', 'delray beach', 'kashagar town', 'buenos aires', 'stephens city', 'qianjiang city', 'san carlos', 'san antonio', 'north potomac', 'city of barnaul', 'bolshoy uluy', 'dongguan shi', 'fort myers', 'wa state', 'kab. temanggung', 'town of azov', 'frankfurt am main', 'kara-balta city', 'bandar imam', 'keketala city', 'canoga park', "people's republic of luzhou", 'ho chi minh', 'battle creek', 'oberwil bl', 'missouri city', 'port huron', 'oak lawn', 'san martín', 'kaw thaung', 'itta bena', 'houghton regis', 'moreno valley', 'zhongxiang city', 'kota bima', 'chester le street', 'pré saint gervais', 'yatai new city', 'east troy', 'st. julians', 'sao luis', 'rinala khurd', 'torez city', 'boldon colliery', 'bel air', 'letchworth garden city', 'nowy tomysl', 'deir qanoun en nahr', 'kwun tong', 'san lorenzo', 'maple grove', 'whitley bay', 'the hague', 'yiyang city', 'nantong shi', 'weizhou town', "st george's", 'brierley hill', "musa qal'ah", 'south gate', 'zhuanghe city', 'battle ground', 'harat hurayk', 'city moscow', 'fort meyers', 'ningbo shi', 'zhumadian city', 'quezon city', 'darwin city', 'jakarta selatan', 'del ray beach', 'north hamptonshire', 'spokane valley', 'volodarskiy district', 'shenzhen shi', 'oum el-bouaghi', 'samut prakan', 'al moukalla', 'church stretton', 'colorado springs', 'qingyuan city', 'woods cross', 'municipiul buzau', 'opa locka', 'rapid city', 'kyzl-kia town', 'nyaung oo', 'kabupaten sidoarjo', 'cliffside park', 'goose creek', 'shwe kokko', 'bandar mahshahr', 'saint leonard', 'wuhu shi', 'bandar lampung', 'kuala lumpar', 'los baños', 'bandar anzali', 'le port', 'noordwijk zuid-holland', 'clearwater beach', 'qianjiang shi', 'rongmei town', 'fort walton beach', 'haikou city province', 'bander amirabad', 'alor setar', 'n chesterfield', 'pompano beach', 'oakland park', 'scott depot', 'nyaung u', 'changzhou shi', 'maanshan city', 'san gabriel', 'mount isa', 'new milford', 'san llorenc', 'gorod novosibirsk', 'st ekaterinburg', 'nizhni novgorod', 'sheung wan', 'shijiazhuang shi', 'miram shah', 'big stone gap', 'gulistan city', 'bekasi utara', 'new bedford,', 'beit layeh', 'sansha city', 'changde city', 'vinh city', 'dobbs ferry', 'lake charles', 'west nyack', 'safety harbor', 'kuala kangsar', 'd.i. khan', 'naypyitaw division', 'yorba linda', 'wen zhou', 'wenzhou city', 'ft eustis', 'vint hill', 'yangzhou shi', 'jakarta timur', 'rowley regis', 'blandford forum', 'jazira al-khamisa', 'nizhny novgorod city', 'zhaoqing shi', 'kansas city', 'port talbot', 'sao paulo', 'zhuhai city', 'zhengzhou area', 'woodford greeni', 'addis ababa', 'jawa tengah', 'san diego', 'rolling fork', 'astana city', 'strada provinciale vejanese snc', 'khabarovsk district', 'qinhuangdao city', 'alar city', 'bad homburg', 'west point', 'fort pierce', 'district heights', 'washington dc', 'east garrison', 'stone mountain', 'zhanjiang city', 'sour tyre', 'sutton coldfield', 'los angeles', 'grand cayman', 'cedar bluff', 'yangquan city', 'dania beach', 'qiqihar city', 'elbow lake', 'port louis', 'south okkalapa township', 'port saint lucie', 'mound bayou', 'republic of tatarstan', 'luliang city', 'sanya city', 'grand island', 'port of spain', 'khan younis', 'church hill', 'ellesmere port', 'jalalabad city', 'north rhine-westphalia', 'al kazimiyah', 'north chesterfield', 'iloilo province', 'zhoushan city', 'zhushan town', 'catia la mar', 'north kingstown', 'brisbane city', 'bexhill on sea', 'bolbasovo town', 'new philadelphia', 'south point', 'banja luka', 'kents store', 'karaj city', 'east norwalk', 'four oaks', 'newton aycliffe', 'bourj el barajneh', 'municipio: luanda', 'nizhny novgorod', 'fuzhou city', 'dongying city', "ta'izz city", 'g staraya kupavna', 'de leon springs', 'saint-aubin sauges', 'nay pyi taw', 'makati city', 'foshan city', 'arkansas city', 'bandar lengeh', 'az zabadani', 'hangzhou city', 'taipei city', 'songzi city', 'beni territory', 'white marsh', 'wuxi city', 'aliso viejo', 'saisai city', 'la ciotat', 'harat hreik', 'baoding city', 'saint petersbug', 'zigong city', 'labao town', 'digos city', 'melton mowbray', 'south okkalapatownship', 'bandar imam khomeini', 'south jakarta', 'huzhou city', 'novy urengoi', 'rajaee city', 'coral gables', 'gabriel leyva solano', 'jinjiang city', 'gorod izhevsk', 'khomeini shahr city', 'sergeant bluff', 'henley on thames', 'yazoo city', 'al meniyeh', 'huaian city', 'guangzhou shi', 'bee cave', 'kuwait city', 'heihe city', 'helmand province', 'manakin sabot', 'shahin shahr', 'winston salem', 'ciudad de panamá', 'lake city', 'al mayadin', 'kandahar city', 'highland park', 'panama city', 'fengyi town', 'gros islet', 'mountain view', 'al aweer', 'turfan city', 'odintsovo municipality', 'east grinstead', 'mir ali', 'los reyes', "da'an city", 'port vila', 'new boston', 'st. paul', 'kokdala city', 'sutton surrey', 'tianjin city', 'boones mill', 'huntington beach', 'whaley bridge', 'san bernardino', 'toms river', 'kalay myo', 'foz do iguacu', 'upper sandusky', "ma'erkang city", 'marikina city', 'thousand oaks', 'chipping campden', 'khan yunis', 'north shield', 'south bend', 'paranaque city', 'apo ae', 'shaoxing city', 'jieyang city', 'baoji city', 'nanan city', 'kota tegal', 'madison heights', 'grand saline', 'mianyang city', 'vientiane capital', 'woodland hills', 'ann arbor', 'east kilbride', 'washington, dc', 'changsha city', 'wuhu city', 'sheyang city', 'city taizhou', 'bandar seri jempol', 'central falls', 'iskenderun hatay', 'ciudad obregon', 'nanping city', 'south boston', 'van nuys', 'palma de mallorca', 'saint helier', 'san gwann sgn', 'xinxiang city', 'city of st. petersburg', 'mary esther', 'ust- dzheguta', 'lynch station', 'sham alam', 'crown point', 'zaragosa nueva', 'dalian city', 'tegucigalpa city', 'bay st. louis', 'nanjing city', 'petaling jaya', 'shaaf al-sourani', 'nanchang city', 'las vagas', 'ishimbai city', 'fountain valley', 'são paulo', 'new castle', 'bolshoy kamen', 'rio claro', 'panjing city', 'yulin city', 'yueqing city', 'kabul city', 'ocean springs', 'jinan city', 'swords creek', 'the esplanade perth', 'mossel bay', 'valley stream', 'nueva ecija', 'fort worth', 'royal leamington spa', 'tlajomulco de zuniga', 'sofia city', 'anqing city', 'walton on thames', 'distrito federal', 'nizhny lomov', 'corpus christi', 'bowling green', 'education town', 'tehsil rinala khurd', 'santa cruz de la siena', 'san fernando', 'phang rang-thap cham city', 'spin boldak district', 'tall ‘afar', 'st. ives', 'jinhua town', 'grand ledge', 'george town', 'kab surabaya', 'san luis potosi', 'kuitun city', 'bolshie vyazyomy', 'santa fe', 'cooper city', 'taiz city', 'south whitley', 'talbot green', 'sunny isles beach', 'glen burnie', 'jingmen city', 'san salvador', 'chong qing city', 'alanya antalya', 'st augustine', 'sysert district', 'hengyang city', 'spring hill', 'leigh on sea', 'north miami', 'bolshoi kamen', 'port glasgow', 'heriot bay', 'taggerang selatan', 'gonbad-e kavus', 'chihuahua city', 'mandaue city', 'nevyanski raion', 'jingdezhen city', 'king george', 'basilan bölgesi', 'nizhnii novgorod', 'pago pago', 'binzhou city', 'mt. sidney', 'ashrafiyat sahnaya', 'hammam lif', 'lipetsk oblast', 'near lincon', 'lytham st. annes', 'ordos city', 'steamboat springs', 'wheat ridge', 'huzhou shi', 'pembroke pines', 'roanoke rapids', 'yinchuan city', 'jinzhou city', 'white plains', 'addu city', 'nizhni tagil', 'kelamayi city', 'overland park', 'guangzhou city guangdong province', 'west jordan', 'cangzhou city', 'mont fleuri', 'st. neots', 'buckhurst hill', 'sudley springs', 'north branch', 'new taipei city', 'pasig city', 'national city', 'baoshan city', 'bingham farms', 'leighton buzzard', 'los fresnos', 'lakki marwat', 'new milton', 'deyang city', 'murmansk oblast', 'san jose', 'zhoushan ocean science city', 'nanning city', 'zhongshan city', 'newport pagnell', 'miami gardens', 'great falls', 'thornton heath', 'gana sapele', 'kazachyi lageri', 'stoke on trent', 'kuala lumpur', 'santa clara', 'pyi oo lwin', 'heitan city', 'peshawar khyber pakhtunkhwa', 'chula vista', 'huainan city', 'al miyeh w miyeh', 'nishni novgorod', 'xianxiang city', 'jiangyin city', 'west columbia', 'gaotieling town', 'city phnom penh', 'vahdat city,', 'bluff city', 'dongguan city', 'eagle pass', 'tashkent city', 'new albany', 'nueva tijuana', 'kowloon city', 'walton on the naze', 'north york', 'fushë kosovë', 'west zhuhai city', 'luhansk city', 'bandar imam khomeini city', 'haidian district', 'king beirut', 'al kharaitiyat', 'donegal town', 'tongliao city', 'hanzhong city', 'dangyang city', 'north arlington', 'fond du lac', 'bethel park', 'yiwu city', 'huangshan city', 'polk city', 'tunbridge wells', 'new york city', 'acton park', 'west hartford', 'bogota d.c.', 'jincheng city', 'twin falls', 'lishui city', 'sharm el-sheikh', 'novy urengoy', 'dale city', 'san fernando del valle de catamarca', 'shangrao city', 'são josé de ribamar', 's. bras de alportel', 'valley center', 'al mukalla', 'taiyuan city', 'la marsa', 'huainan shi', "lu 'an city", 'rio grande', 'guangyuan city', 'city of snezhinsk', 'garden grove', 'russell springs', 'huizhou city', 'east hazelcrest', "lee's summit", 'kfar sir', 'borg el-arab', 'kab. bekasi barat', 'locke haven', 'kab. tegal', 'hsinchu city', 'taizhou city', 'luoyang city', 'prauchap kiri khan', 'qinhuangdao shi', 'new york', 'le paquier', 'coon rapids', 'east windsor', 'tangshan city', 'palm harbor', 'buena park', 'gerrards cross', 'rizhao city', 'walnut ridge', 'santo domingo', 'jiaozhou city', 'rasht gilan', 'new brunswick', 'tall afar', 'nizhny tagil', 'kingston upon thames', 'chiang mai', 'luohe city', 'vadnais heights', 'novo saraybosna', 'front royal', 'west wickham', 'masjed soleiman', 'xuzhou city', 'newport new', 'market rasen', 'hunt valley', 'long branch', 'yasnaya polyana', 'bloomfield hills', 'jiangshan city', 'shenyang city', 'west midlands', 'zhuzhou city', 'mount pleasant', 'cottage grove', 'east york', 'zato sibirskiy', 'la habana', 'santa clarita', 'rancho cucamonga', 'alice springs', 'kish island', 'st. izhevsk', 'west bank', 'saint louis', 'tijuana baja', 'jakarta selantan', 'putian city', 'xingtai city', 'west bridgford', 'la mesa', 'va. beach', 'xiangyang city', 'suining city', 'canvey island', 'post falls', 'changzhou city', 'leningrad oblast', 'fuyang city', 'newmarket on fergus', 'boca raton', 'myit kyi na', "xi'an city", 'fuquay varina', 'hot springs', 'shantou city', 'market harborough', 'west chester', 'san juan', 'agoura hills', 'al farwaniyah', 'rio grande city', 'te awamutu', 'lower hutt', 'bogor city', 'londonderry derry', 'novi banovci', 'great harwood', 'yingcheng city', 'tuen mun', 'waltham abbey', 'newport beach', 'jiaxing shi', 'bandar bushehr', 'polyarnye zori', 'san clemente', 'saint paul', 'kuche city', 'dandong city', 'east lyme', 'kennett square', 'ciudad sandino', 'indo hills', 'the valley', 'bole city', 'des moines', 'canberra city', 'anshun city', 'north charleston', 'jersey city', 'buffalo grove', 'jiujiang city'}
+
+    for i,part in enumerate(parts):
+        # Pure postal (numeric or UK alphanumeric)
+        if re.match(r'^\d{4,7}\.?\d*$',part):
+            if not postal: postal=re.sub(r'\.0+$','',part)
+            continue
+        # UK postcode standalone: 'BD7 1NX', 'EC3A 8BF'
+        m_uk=UK_POST_RE.match(part.strip())
+        if m_uk and re.match(r'^[A-Z]{1,2}\d',part.strip(),re.I) and len(part.strip())<=9:
+            # Only if whole part IS the postcode (no trailing country like 'EC3A 8EE UK')
+            if not postal: postal=m_uk.group(1)
+            continue
+        # "8600 Dübendorf" — only if city part has no street keywords
+        # (prevents '1625 Mid Valley Drive...' being treated as postal+city)
+        m1=re.match(r'^(\d{4,5})\s+([A-ZÀ-ɏ]\S.+)$',part)
+        if m1 and not ADDR_RE.search(m1.group(2)):
+            if not postal: postal=m1.group(1)
+            if not city:   city=m1.group(2)
+            continue
+        # ISO alone
+        if ISO2_RE.match(part) and part in ISO_TO_COUNTRY and part not in ('No','D'):
+            if not country: country=ISO_TO_COUNTRY[part]
+            continue
+        # Strip trailing punctuation for country checks
+        part_stripped = re.sub(r'[\.\,\s]+$', '', part).strip()
+        # Country+Postal BEFORE Country-alone
+        mc_p=re.match(r'^('+COUNTRY_RE.pattern+r')\s+(\d{4,7})\s*$',part_stripped,re.I)
+        if mc_p:
+            if not country: country=mc_p.group(1)
+            if not postal:  postal=mc_p.group(mc_p.lastindex)
+            continue
+        # Country alone (fullmatch) — use part_stripped to handle "Turkey." etc.
+        if COUNTRY_RE.search(part_stripped) and re.fullmatch(COUNTRY_RE.pattern,part_stripped,re.I):
+            if not country: country=part_stripped
+            continue
+        # Standalone city adjacent to geo part or province/state part
+        if is_city_part(part) and not city:
+            nxt=i+1<len(parts) and has_geo(parts[i+1])
+            prv=i>0 and has_geo(parts[i-1])
+            # Also fire if next part is a state/province (e.g. 'Lahore, Punjab Province, Pakistan')
+            nxt_state=(i+1<len(parts) and STATE_KW.search(parts[i+1])
+                       and not ADDR_RE.search(parts[i+1]))
+            # Also fire if previous part is a street address (ADDR_RE match)
+            # e.g. 'Abali Road/Azmayesh Junction, Tehran' → Tehran is city
+            prv_addr=(i>0 and bool(ADDR_RE.search(parts[i-1])) and not has_geo(parts[i-1]))
+            if nxt or prv or nxt_state or prv_addr: city=part; continue
+        # Embedded country/postal/ISO
+        # Also treat 'REPUBLIC OF DAGESTAN' / '...DISTRICT OF THE REPUBLIC OF DAGESTAN' as country indicators
+        _part_clean = part.strip().rstrip('.,')
+        _part_norm = normalize_country(_part_clean)
+        _part_norm_is_country = bool(_part_norm and _part_norm != _part_clean
+                                     and get_country_code(_part_norm))
+        if not _part_norm_is_country:
+            # Check if part ENDS with 'REPUBLIC OF <word>' pattern
+            _rep_m = re.search(r'\bREPUBLIC\s+OF\s+(\w[\w\s\-]*)$', _part_clean, re.I)
+            if _rep_m:
+                _rep_cand = 'Republic of ' + _rep_m.group(1).strip().title()
+                _rep_norm = normalize_country(_rep_cand.lower())
+                if _rep_norm and get_country_code(_rep_norm):
+                    _part_norm = _rep_norm
+                    _part_norm_is_country = True
+        has_c=((bool(COUNTRY_RE.search(part)) and not ISO2_RE.match(part.strip()))
+               or _part_norm_is_country)
+        has_p=(bool(re.search(r'\s\d{4,7}\.?\d*\s*$',part))
+               or bool(re.search(r'\s\d{4,7}\.?\d*\s+[A-Z][a-z]+\s*$',part)))
+        ie=part.strip().rstrip('.,').split()[-1] if part.strip() else ''
+        has_i=bool(ISO2_RE.match(ie) and ie in ISO_TO_COUNTRY and ie not in ('No','D'))
+        has_uk=bool(UK_POST_RE.search(part)) and bool(re.search(r'[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\s*$', part, re.I))
+        if has_c or has_p or has_i or has_uk:
+            rem,nc,np,nco,na2=strip_tail(part,city,postal,country)
+            if rem: street_parts.append(rem)
+            if not city and nc:    city=nc
+            if not postal and np:  postal=np
+            if not country and nco: country=nco
+            if not a2_add and na2: a2_add=na2
+            continue
+        # Street part with embedded postal+city: "Str 30. 8600 Dübendorf"
+        if re.search(r'\d{4,5}\s+[A-ZÀ-ɏ]',part):
+            m2=re.search(r'(\d{4,5})\s+([A-ZÀ-ɏ][a-zÀ-ɏ]+(?:\s+[A-Z][a-z]+)?)\s*$',part)
+            if m2:
+                if not postal: postal=m2.group(1)
+                if not city:   city=m2.group(2)
+                street_parts.append(part[:m2.start()].strip()); continue
+        # Last (or second-to-last before country) district/region → a2_add
+        _is_last_district = (
+            i == len(parts)-1 or
+            (i == len(parts)-2 and re.fullmatch(COUNTRY_RE.pattern,
+                parts[i+1].strip().rstrip('.,'), re.I))
+        )
+        if (_is_last_district and STATE_KW.search(part)
+                and not ADDR_RE.search(part) and not re.search(r'\d', part)):
+            if not a2_add: a2_add = part
+            continue
+        # City appended to street: "...Cad. Izmir" or "...Kat Tuzla/Istanbul"
+        words=part.split()
+        if len(words)>1 and not city:
+            last=words[-1]
+            # Handle "District/City" slash pattern (e.g. "Tuzla/Istanbul")
+            if '/' in last and last.count('/') == 1:
+                sp = last.split('/')
+                if (re.match(r'^[A-ZÀ-ɏ]', sp[0]) and
+                        re.match(r'^[A-ZÀ-ɏ]', sp[1])):
+                    a2_add = sp[0]
+                    city   = sp[1]
+                    street_parts.append(' '.join(words[:-1]).strip())
+                    continue
+            if (re.match(r'^[A-ZÀ-ɏ]',last) and not re.match(r'^\d',last)
+                    and not ADDR_RE.search(last) and not COUNTRY_RE.match(last) and len(last)>2):
+                rest=' '.join(words[:-1])
+                if ADDR_RE.search(rest): city=last; street_parts.append(rest); continue
+        street_parts.append(part)
+
+    # No-comma fallback — only if the single part wasn't already processed above
+    if not street_parts and not city and not postal and not country and len(parts)==1:
+        rem,nc,np,nco,na2=strip_tail(a1,'','','')
+        if not city and nc:    city=nc
+        if not postal and np:  postal=np
+        if not country and nco: country=nco
+        if not a2_add and na2: a2_add=na2
+        if rem: street_parts.append(rem)
+    elif not street_parts and len(parts)==1 and (city or country):
+        # Values extracted but A1 still has them — strip them out
+        rem,_,_,_,_=strip_tail(a1, city, postal, country)
+        if rem and rem != a1: street_parts.append(rem)
+
+
+    if country:
+        country=COUNTRY_NORMALIZE.get(country.lower().strip(),country) or country
+    if country and ISO2_RE.match(country) and country in ISO_TO_COUNTRY:
+        country=ISO_TO_COUNTRY[country]
+
+    return ', '.join(p for p in street_parts if p.strip()), city, postal, country, a2_add, ''
+
+
+def infer_country(city, state, postal):
+    c = str(city  or '').strip().lower()
+    s = str(state or '').strip().lower()
+    p = str(postal or '').strip()
+    if c in CITY_TO_COUNTRY: return CITY_TO_COUNTRY[c]
+    if s in TERRITORY_TO_COUNTRY: return TERRITORY_TO_COUNTRY[s]
+    if s in {'maharashtra','karnataka','gujarat','uttar pradesh','west bengal',
+             'andhra pradesh','telangana','kerala','punjab','haryana','rajasthan',
+             'tamil nadu','madhya pradesh','odisha','goa','assam','bihar'}:
+        return 'India'
+    if s in {'shandong','guangdong','zhejiang','jiangsu','sichuan','hubei',
+             'hunan','henan','hebei','fujian','liaoning','yunnan','guangxi',
+             'anhui','jiangxi','shaanxi','xinjiang','beijing','shanghai',
+             'tianjin','chongqing'}:
+        return 'China'
+    if re.search(r'\b(Oblast|Krai|Okrug|Bashkortostan|Tatarstan|Dagestan|'
+                 r'Komi|Udmurt|Leningrad|Sverdlovsk|Karachay|Kabardino|Chechen|'
+                 r'Ingush|Ossetia|Adygea|Buryat|Yakut|Sakha|Altai|Khakass|Tuva|'
+                 r'Mordovia|Mari|Chuvash|Kalmyk|Avar|Bashkir|Kabardin|Balkar|'
+                 r'Kemerovsk|Ryazan|Saratov|Samara|Penza|Tambov|Tver|Bryansk|'
+                 r'Ivanovo|Kostroma|Vladimir|Yaroslavl|Vologda|Arkhangelsk|Murmansk|'
+                 r'Novgorod|Pskov|Smolensk|Kaluga|Tula|Kursk|Voronezh|Lipetsk|'
+                 r'Orenburg|Chelyabinsk|Tyumen|Omsk|Novosibirsk|Tomsk|Irkutsk|'
+                 r'Chita|Amur|Magadan|Kamchatsk|Sakhalin)\b', s, re.I):
+        return 'Russia'
+    if s in US_STATE_EXPAND.values() or s in {v.lower() for v in US_STATE_EXPAND.values()}:
+        return 'United States'
+    if s in {v.lower() for v in CA_PROV_EXPAND.values()}:
+        return 'Canada'
+    if s in {'yangon region','mandalay region','yangon','mandalay'}:
+        return 'Myanmar'
+    if s in {'ontario','quebec','alberta','british columbia','manitoba',
+             'new brunswick','nova scotia','saskatchewan',
+             'newfoundland and labrador'}:
+        return 'Canada'
+    if re.match(r'^\d{6}$', p): return 'Russia'
+    return ''
+
+def validate_postal(p, country):
+    POSTAL_FMTS = {
+        'russia':r'^\d{6}$','ukraine':r'^\d{5,6}$','china':r'^\d{6}$',
+        'india':r'^\d{6}$','united states':r'^\d{5}(-\d{4})?$',
+        'united kingdom':r'^[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}$',
+        'germany':r'^\d{5}$','france':r'^\d{5}$',
+        'switzerland':r'^(CH-?)?\d{4}$','austria':r'^\d{4}$',
+        'netherlands':r'^\d{4}\s?[A-Z]{2}$',
     }
+    p = str(p or '').strip()
+    if not p: return 'MISSING'
+    if JUNK_POSTAL.match(p): return 'INVALID'
+    fmt = POSTAL_FMTS.get(str(country or '').lower().strip())
+    if not fmt: return 'VALID'
+    return 'VALID' if re.match(fmt, p, re.I) else 'INVALID'
 
-    # Fill missing mappings with key itself (so code works if columns exist)
-    for k, v in list(mapping.items()):
-        if not v and k not in {"POSTAL_FLAG", "DATA_QUALITY"}:
-            mapping[k] = k
+def data_quality(row, col_map):
+    has = sum([
+        bool(str(row.get(col_map.get('address',''),'') or '').strip()),
+        bool(str(row.get(col_map.get('city',''),'')   or '').strip()),
+        bool(str(row.get(col_map.get('postal',''),'') or '').strip()),
+        bool(str(row.get(col_map.get('country',''),'')or '').strip()),
+    ])
+    return 'COMPLETE' if has==4 else 'PARTIAL' if has>=2 else 'MISSING'
 
-    return mapping
+# ── Column hint detection ─────────────────────────────────────────
+HINTS = {
+    'address_id':  ['addressid','address_id','addressno','addressnumber','addr_id','addrid'],
+    'address':    ['address1','address','addr1','street','line1'],
+    'address2':   ['address2','addr2','line2'],
+    'address3':   ['address3','addr3','line3'],
+    'city':       ['city','town','locality'],
+    'state':      ['state','province','region','oblast'],
+    'postal':     ['postal','zip','postcode','postalcode'],
+    'country':    ['country','countryname','nation'],
+    'country_id': ['countryid','country_id','countrycode','country_code','iso'],
+}
+def guess_col(headers, field):
+    for h in headers:
+        clean = h.lower().replace(' ','').replace('_','')
+        if any(clean == hint for hint in HINTS[field]):
+            return h
+    return ''
+
+# ══════════════════════════════════════════════════════════════════
+# STREAMLIT UI
+# ══════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+.stApp { max-width: 1400px }
+.metric-row { display: flex; gap: 12px; margin-bottom: 16px }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-address splitter
+# ─────────────────────────────────────────────────────────────────────────────
+def split_multi_address(a1):
+    """Split a multi-address field into list of (label, address) tuples.
+    Handles: Branch Office N:, Address N:, Labeled sections, a)/b)/c), semicolons.
+    Returns [(label_str, address_str), ...].
+    """
+    if not a1: return []
+    a1 = re.sub(
+        r'(?:Telephone|Tel|Phone|Fax|Mobile|Email|e-mail|Website|Web|www)'
+        r'[:\s][^\n;,]+[,;]?\s*', '', a1, flags=re.I).strip()
+
+    def _split_roman(text):
+        ROMAN = re.compile(r'\s*(?:;?\s*)?\b(i{1,4}v?|vi{0,3}|ix|x)\)\s*', re.I)
+        subs = ROMAN.split(text)
+        results = []
+        first = subs[0].strip().rstrip(';, ').strip()
+        if first and ',' in first:
+            results.append(first)
+        j = 2
+        while j < len(subs):
+            content = subs[j].strip().rstrip(';, ').strip()
+            if content:
+                results.append(content)
+            j += 2
+        return results if results else [text.strip()]
+
+    def _split_labeled(text, pat, sub_roman=False):
+        parts = pat.split(text)
+        results = []
+        i = 1
+        while i < len(parts) - 1:
+            label   = parts[i].strip()
+            content = parts[i+1].strip().rstrip(';, ').strip()
+            if sub_roman:
+                for addr in _split_roman(content):
+                    if addr.strip():
+                        results.append((label, addr.strip().rstrip(';, ').strip()))
+            else:
+                if content:
+                    results.append((label, content))
+            i += 2
+        return results
+
+    BRANCH = re.compile(r',?\s*(Branch\s+Office\s+\d+):\s*', re.I)
+    if BRANCH.search(a1):
+        return _split_labeled(a1, BRANCH, sub_roman=True)
+
+    ADDR_N = re.compile(
+        r',?\s*((?:Last\s+Known\s+)?(?:Residential\s+)?Address(?:es)?\s+\d+):\s*', re.I)
+    if ADDR_N.search(a1):
+        return _split_labeled(a1, ADDR_N, sub_roman=False)
+
+    LABELLED = re.compile(
+        r',?\s*((?:Registered|Primary|Secondary|Headquarters?|HQ|Principal|'
+        r'Incorporation|Former|Previous|Current)\s*(?:Address(?:es)?)?|'
+        r'Formerly?\s+(?:at|of)?):\s*', re.I)
+    if LABELLED.search(a1):
+        return _split_labeled(a1, LABELLED, sub_roman=False)
+
+    if re.search(r'(?:^|\n\n)[a-z]\)\s+\w', a1, re.I):
+        parts = re.split(r'\n\n(?=[a-z]\)\s)', a1, flags=re.I)
+        results = []
+        for p in parts:
+            p = re.sub(r'^[a-z]\)\s*', '', p.strip(), flags=re.I)
+            if p.strip():
+                results.append(('', p.strip().rstrip('; ').strip()))
+        return results
+
+    if ';' in a1:
+        subs = [s.strip().rstrip(', ').strip() for s in re.split(r';\s*', a1) if s.strip()]
+        if len(subs) >= 2 and all(',' in s or len(s.split()) >= 3 for s in subs):
+            return [('', s) for s in subs]
+
+    return [('', a1.strip())]
 
 
-def ensure_output_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if "POSTAL_FLAG" not in df.columns:
-        df["POSTAL_FLAG"] = ""
-    if "DATA_QUALITY" not in df.columns:
-        df["DATA_QUALITY"] = ""
-    return df
+st.title("🗺️ Address Cleaning Agent")
+st.caption("Upload any Excel or CSV — automatically extracts city, postal, country and routes each value to the correct column.")
 
-
-def clean_dataframe(df: pd.DataFrame, colmap: Dict[str, str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df2 = df.copy()
-    df2 = ensure_output_columns(df2)
-
-    change_rows = []
-
-    for idx, r in df2.iterrows():
-        row = r.to_dict()
-        new_row, changes = clean_row(row, colmap)
-        df2.loc[idx] = pd.Series(new_row)
-        for field, before, after in changes:
-            if before != after:
-                change_rows.append({"Row": idx + 1, "Field": field, "Before": before, "After": after})
-
-    changes_df = pd.DataFrame(change_rows)
-    return df2, changes_df
-
-
-def to_excel_bytes(cleaned: pd.DataFrame, changes: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        cleaned.to_excel(writer, sheet_name="Cleaned Data", index=False)
-        changes.to_excel(writer, sheet_name="Changes Log", index=False)
-    return buf.getvalue()
-
-
-# -------------------------------
-# UI
-# -------------------------------
-
-st.title("🗺️ Address Cleaning Agent (Enhanced)")
-st.caption("Offline, deterministic address cleanup with improved handling for CITY./VILL. style inputs.")
-
+# ── Sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("1) Upload")
-    up = st.file_uploader("Drop Excel or CSV", type=["xlsx", "xls", "csv"])
+    st.header("⚙️ Settings")
 
-    st.header("2) Options")
-    st.checkbox("Extract locality from ADDRESS1 (CITY./VILL./SETTLEMENT)", value=True)
-    st.checkbox("Explicit country mention overrides ambiguous inference", value=True)
-    st.caption("(These options are always enabled in the enhanced rules; toggles are for future extensions.)")
+    uploaded = st.file_uploader(
+        "Upload file to clean",
+        type=["xlsx","xls","csv"],
+        help="Excel or CSV with address data"
+    )
 
-    run = st.button("▶ Clean Addresses", type="primary", use_container_width=True)
+    col_map = {}
+    df_raw  = None
 
-if not up:
-    st.info("Upload add1.xlsx (or any Excel/CSV) to begin.")
+    if uploaded:
+        try:
+            if uploaded.name.endswith(".csv"):
+                df_raw = pd.read_csv(uploaded)
+            else:
+                df_raw = pd.read_excel(uploaded)
+            df_raw = df_raw.fillna('').astype(str).replace('nan','')
+            headers = df_raw.columns.tolist()
+            st.success(f"✓ {len(df_raw):,} rows · {len(headers)} columns")
+
+            st.divider()
+            st.subheader("Column Mapping")
+            for field in ['address_id','address','address2','address3','city','state','postal','country','country_id']:
+                default = guess_col(headers, field)
+                idx = headers.index(default)+1 if default in headers else 0
+                col_map[field] = st.selectbox(
+                    field.replace('_',' ').title(),
+                    ['— skip —']+headers,
+                    index=idx, key=f'col_{field}'
+                )
+                col_map[field] = '' if col_map[field]=='— skip —' else col_map[field]
+
+        except Exception as e:
+            st.error(f"Error reading file: {e}")
+            uploaded = None
+
+    st.divider()
+    st.subheader("Options")
+    o_postal  = st.checkbox("Validate postal codes",  True)
+    o_quality = st.checkbox("Add data quality score", True)
+    o_infer   = st.checkbox("Infer missing countries", True)
+
+    run = st.button(
+        "▶  Clean Addresses", type="primary",
+        use_container_width=True, disabled=uploaded is None
+    )
+
+# ── Main ──────────────────────────────────────────────────────────
+if not uploaded:
+    st.info("👈 Upload a file in the sidebar to get started")
     st.stop()
 
-# Load file
-if up.name.lower().endswith(".csv"):
-    df_in = pd.read_csv(up)
-else:
-    df_in = pd.read_excel(up, engine="openpyxl")
-
-st.subheader("Raw preview")
-st.dataframe(df_in.head(30), use_container_width=True)
-
-colmap = build_default_colmap(df_in)
-
-with st.expander("Column mapping (auto-detected)", expanded=False):
-    st.write("If your headers differ, adjust them here.")
-    cols = [""] + list(df_in.columns)
-    for k in ["ADDRESS1", "ADDRESS2", "CITY", "STATE", "POSTAL", "COUNTRY", "COUNTRY_ID"]:
-        current = colmap.get(k, "")
-        idx = cols.index(current) if current in cols else 0
-        colmap[k] = st.selectbox(k, options=cols, index=idx)
-
-if not run:
+if not run and 'cleaned_df' not in st.session_state:
+    st.subheader("Preview")
+    st.dataframe(df_raw.head(30), use_container_width=True)
+    st.caption(f"Showing 30 of {len(df_raw):,} rows")
     st.stop()
 
-st.subheader("Cleaning output")
-with st.spinner("Cleaning..."):
-    cleaned_df, changes_df = clean_dataframe(df_in, colmap)
+if run:
+    df     = df_raw.copy()
+    diffs  = []
+    total  = len(df)
+    prog   = st.progress(0, text="Starting...")
 
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    st.metric("Rows", len(cleaned_df))
-with c2:
-    st.metric("Changed fields", len(changes_df))
-with c3:
-    st.metric("Complete", int((cleaned_df.get("DATA_QUALITY", "") == "COMPLETE").sum()) if "DATA_QUALITY" in cleaned_df.columns else 0)
+    def C(col): return col_map.get(col,'')
+    def get(row, col): return str(row.get(C(col),'') or '').strip()
+    def record(idx, field_key, before, after):
+        if before != after and after and C(field_key):
+            diffs.append({'Row':idx+1,'Field':C(field_key),'Before':before,'After':after})
+    def setcol(idx, field_key, val):
+        if C(field_key): df.at[idx, C(field_key)] = val
 
-st.markdown("#### Cleaned preview")
-st.dataframe(cleaned_df.head(50), use_container_width=True)
 
-st.markdown("#### Changes log (preview)")
-st.dataframe(changes_df.head(200), use_container_width=True)
+    # ── Pre-process: expand multi-address rows ──────────────────────
+    if C('address'):
+        new_rows = []
+        drop_idx  = []
+        for idx, row in df.iterrows():
+            a1_raw = str(row.get(C('address'),'') or '').strip()
+            splits = split_multi_address(a1_raw)
+            if len(splits) > 1:
+                drop_idx.append(idx)
+                for seq, (label, addr) in enumerate(splits, start=1):
+                    new_row = row.copy()
+                    new_row[C('address')] = addr
+                    # Assign sequential ADDRESS_ID: 1, 2, 3, ...
+                    if C('address_id'):
+                        new_row[C('address_id')] = str(seq)
+                    # Store branch label in ADDRESS2 if it's empty
+                    if label and C('address2') and not str(new_row.get(C('address2'),'') or '').strip():
+                        new_row[C('address2')] = label
+                    new_rows.append(new_row)
+        if drop_idx:
+            df = df.drop(index=drop_idx)
+            if new_rows:
+                import pandas as _pd
+                expanded = _pd.DataFrame(new_rows)
+                df = _pd.concat([df, expanded], ignore_index=True)
+            total = len(df)
+            prog.progress(0, text=f"Expanded {len(drop_idx)} multi-address rows → {total:,} total rows…")
 
-excel_bytes = to_excel_bytes(cleaned_df, changes_df)
+    for idx, row in df.iterrows():
+        if idx % 1000 == 0:
+            prog.progress(idx/total, text=f"Processing row {idx:,} of {total:,}…")
 
-st.download_button(
-    "⬇ Download cleaned Excel",
-    data=excel_bytes,
-    file_name="cleaned_addresses.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
+        a1  = get(row,'address')
+        a2  = get(row,'address2')
+        a3  = get(row,'address3')
+        cty = get(row,'city')
+        st_ = get(row,'state')
+        pst = get(row,'postal')
+        cou = get(row,'country')
+        cid = get(row,'country_id')
+
+        # ── 1. Normalize COUNTRY ──────────────────────────────────
+        if cou:
+            norm = normalize_country(cou)
+            if norm != cou:
+                record(idx,'country',cou,norm)
+                setcol(idx,'country',norm); cou=norm
+
+        # ── 2. Fix STATE abbreviations ────────────────────────────
+        if ISO2_RE.match(st_):
+            if st_ in US_STATES:
+                new_st = US_STATE_EXPAND[st_]
+                record(idx,'state',st_,new_st)
+                setcol(idx,'state',new_st); st_=new_st
+                if not cou:
+                    setcol(idx,'country','United States'); cou='United States'
+                    setcol(idx,'country_id','US');         cid='US'
+            elif st_ in CA_PROVS:
+                new_st = CA_PROV_EXPAND[st_]
+                record(idx,'state',st_,new_st)
+                setcol(idx,'state',new_st); st_=new_st
+                if not cou:
+                    setcol(idx,'country','Canada'); cou='Canada'
+                    setcol(idx,'country_id','CA'); cid='CA'
+            elif st_ in ISO_TO_COUNTRY:
+                if not cou:
+                    setcol(idx,'country',ISO_TO_COUNTRY[st_]); cou=ISO_TO_COUNTRY[st_]
+                if not cid:
+                    setcol(idx,'country_id',st_); cid=st_
+                setcol(idx,'state',''); st_=''
+
+        # ── 3. Fix POSTAL junk ────────────────────────────────────
+        if pst and JUNK_POSTAL.match(pst):
+            setcol(idx,'postal',''); pst=''
+
+        # ── 4. Postal in STATE → move ─────────────────────────────
+        if re.match(r'^\d{4,6}$', st_) and not pst:
+            record(idx,'postal','',st_)
+            setcol(idx,'postal',st_); pst=st_
+            setcol(idx,'state','');   st_=''
+
+        # ── 5. Country name in STATE → move ──────────────────────
+        if st_ and COUNTRY_RE.match(st_) and not ADDR_RE.search(st_):
+            norm = normalize_country(st_)
+            if not cou:
+                record(idx,'country','',norm)
+                setcol(idx,'country',norm); cou=norm
+            setcol(idx,'state',''); st_=''
+
+        # ── 6. Territory in STATE → infer COUNTRY ─────────────────
+        if st_.lower() in TERRITORY_TO_COUNTRY and not cou:
+            tc = TERRITORY_TO_COUNTRY[st_.lower()]
+            setcol(idx,'country',tc); cou=tc
+
+        # ── 7. Fix ADDRESS2 ───────────────────────────────────────
+        if a2:
+            if STATE_KW.search(a2) and not ADDR_RE.search(a2) and not st_:
+                record(idx,'state','',a2)
+                setcol(idx,'state',a2); st_=a2
+                setcol(idx,'address2',''); a2=''
+            elif re.match(r'^\d{4,6}$',a2) and not pst:
+                setcol(idx,'postal',a2); pst=a2
+                setcol(idx,'address2',''); a2=''
+            elif (not cty and not ADDR_RE.search(a2) and not COUNTRY_RE.search(a2)
+                    and not re.match(r'^\d',a2) and len(a2.split(','))<=2):
+                record(idx,'city','',a2)
+                setcol(idx,'city',a2); cty=a2
+                setcol(idx,'address2',''); a2=''
+
+        # ── 8. Fix ADDRESS3 ───────────────────────────────────────
+        if a3:
+            if re.compile(r'\b(Oblast|Penzenskaya|Novosibirskaya)\b',re.I).search(a3) and not st_:
+                setcol(idx,'state',a3); st_=a3
+                setcol(idx,'address3',''); a3=''
+            elif re.match(r'^\d{4,6}$',a3) and not pst:
+                setcol(idx,'postal',a3); pst=a3
+                setcol(idx,'address3',''); a3=''
+
+        # ── 9. Parse CITY field ───────────────────────────────────
+        if cty:
+            # Remove embedded postal
+            city_parts = [p.strip() for p in cty.split(',')]
+            clean_city = []
+            for part in city_parts:
+                if re.match(r'^\d{5,6}$',part) and not pst:
+                    setcol(idx,'postal',part); pst=part
+                else:
+                    clean_city.append(part)
+            if len(clean_city) != len(city_parts):
+                cty = ', '.join(clean_city); setcol(idx,'city',cty)
+
+            city_v, state_v, addr3_v = parse_city_field(cty)
+            if city_v != cty or state_v or addr3_v:
+                record(idx,'city',cty,city_v)
+                setcol(idx,'city',city_v); cty=city_v
+                if state_v:
+                    setcol(idx,'state',state_v); st_=state_v
+                if addr3_v and C('address3'):
+                    ex = str(df.at[idx,C('address3')]).strip()
+                    setcol(idx,'address3',(ex+', '+addr3_v).strip(', ') if ex else addr3_v)
+
+        # ── 10. Extract territory from ADDRESS1 ───────────────────
+        if a1 and not NOTE_RE.match(a1):
+            tm = TERRITORY_RE.search(a1)
+            if tm:
+                territory = tm.group(1).strip()
+                if not st_: setcol(idx,'state',territory); st_=territory
+                if not cou:
+                    tc = TERRITORY_TO_COUNTRY.get(territory.lower(),'')
+                    if tc: setcol(idx,'country',tc); cou=tc
+                clean_a1 = TERRITORY_RE.sub('',a1).strip().strip(',').strip()
+                setcol(idx,'address',clean_a1); a1=clean_a1
+
+        # ── 11. Parse ADDRESS1 ────────────────────────────────────
+        if a1 and not NOTE_RE.match(a1):
+            # Clear CITY if it equals raw ADDRESS1 (bug from earlier)
+            if cty and (cty == a1 or ADDR_RE.search(cty)):
+                setcol(idx,'city',''); cty=''
+
+            # FIX A: If a1 is a single city-like token (came from "CITY. NAME;" pattern),
+            # treat it directly as city without going through the full parser.
+            _PLACE_TYPE_PREFIX = re.compile(
+                r'^(?:CITY|VILL?|TOWN|STN|VLG|PGT|SELO|DEREVNYA)[\.\s]+', re.I)
+            _orig_a1_had_prefix = bool(_PLACE_TYPE_PREFIX.match(get(row, 'address')))
+            _preextract_city = ''
+            if (_orig_a1_had_prefix and ',' not in a1
+                    and not ADDR_RE.search(a1) and not STATE_KW.search(a1)
+                    and re.match(r'^[A-ZÀ-ɏ]', a1)):
+                # a1 is just the city name — set directly
+                _preextract_city = a1
+                a1 = ''
+            elif ',' not in a1:
+                # FIX B: "NAME REGION_KW" no-comma — pre-extract first word as city
+                _city_prefix_match = re.match(
+                    r'^([A-Z][A-Za-z\u00C0-\u024F\-]+)\s+(.+)$', a1)
+                if _city_prefix_match and not ADDR_RE.search(_city_prefix_match.group(1)):
+                    _candidate_city = _city_prefix_match.group(1)
+                    _remainder = _city_prefix_match.group(2)
+                    if STATE_KW.search(_remainder) and not STATE_KW.search(_candidate_city):
+                        _preextract_city = _candidate_city
+                        a1 = _remainder  # parse the region portion only
+
+            # Always pass empty pre-sets so strip_tail cleans A1 fully.
+            # Use existing values only to avoid overwriting already-filled columns.
+            clean_a1, new_city, new_postal, new_country, new_a2, new_a3 = \
+                extract_from_address1(a1, '', '', '')
+            # If we pre-extracted a city, always use it (ignore any city the parser found
+            # in the region text — e.g. "PERM" from "PERM REGION" is a false city match)
+            if _preextract_city:
+                orig_a1_for_record = _preextract_city + (' ' + a1 if a1 else '')
+                new_city = _preextract_city  # always override
+                # Capture any state info from what the parser found in the region text
+                if new_a2 and not st_:
+                    setcol(idx, 'state', new_a2); st_ = new_a2
+                    new_a2 = ''
+                elif clean_a1 and STATE_KW.search(clean_a1) and not st_:
+                    setcol(idx, 'state', clean_a1); st_ = clean_a1
+                # Clear address — region text is not street address
+                clean_a1 = ''
+                a1 = orig_a1_for_record
+
+            # FIX: Strip any trailing semicolons/commas from parsed address
+            clean_a1 = re.sub(r'[;,]+\s*$', '', clean_a1).strip()
+            if clean_a1 != a1:  # includes clean_a1=='' (all content distributed)
+                record(idx,'address',a1,clean_a1)
+                setcol(idx,'address',clean_a1)
+
+            if new_city and not cty:
+                record(idx,'city','',new_city)
+                setcol(idx,'city',new_city); cty=new_city
+
+            if new_postal and not pst:
+                record(idx,'postal','',new_postal)
+                setcol(idx,'postal',new_postal); pst=new_postal
+
+            if new_country and not cou:
+                norm = normalize_country(new_country)
+                record(idx,'country','',norm)
+                setcol(idx,'country',norm); cou=norm
+
+            if new_a2 and not a2 and C('address2'):
+                setcol(idx,'address2',new_a2)
+
+            if new_a3 and C('address3'):
+                ex = str(df.at[idx,C('address3')] if C('address3') else '').strip()
+                if not ex: setcol(idx,'address3',new_a3)
+
+        # ── 11b. Resolve "REPUBLIC OF X" / country name still in ADDRESS1 ──────
+        if C('address') and not cou:
+            _a1_check = str(df.at[idx, C('address')] if C('address') in df.columns else '').strip()
+            _a1_check = re.sub(r'[;,]+\s*$', '', _a1_check).strip()
+            if _a1_check:
+                # Try fullmatch on the whole remaining value
+                _a1_stripped2 = re.sub(r'[.,]+$', '', _a1_check).strip()
+                if COUNTRY_RE.search(_a1_stripped2) and re.fullmatch(COUNTRY_RE.pattern, _a1_stripped2, re.I):
+                    _norm2 = normalize_country(_a1_stripped2)
+                    setcol(idx, 'country', _norm2); cou = _norm2
+                    setcol(idx, 'address', '')
+                else:
+                    # Try to find country name at end after a comma
+                    _parts2 = [p.strip() for p in _a1_check.split(',')]
+                    for _p2 in reversed(_parts2):
+                        _p2s = re.sub(r'[.,;]+$', '', _p2).strip()
+                        if (COUNTRY_RE.search(_p2s) and
+                                re.fullmatch(COUNTRY_RE.pattern, _p2s, re.I) and
+                                not ADDR_RE.search(_p2s)):
+                            _norm2 = normalize_country(_p2s)
+                            setcol(idx, 'country', _norm2); cou = _norm2
+                            break
+                    # Try "REPUBLIC OF X" pattern anywhere in remaining address
+                    if not cou:
+                        _rep_m2 = re.search(r'\bREPUBLIC\s+OF\s+([\w][\w\s\-]+?)(?:[;,]|$)', _a1_check, re.I)
+                        if _rep_m2:
+                            _rep_cand2 = 'Republic of ' + _rep_m2.group(1).strip().title()
+                            _rep_norm2 = normalize_country(_rep_cand2.lower())
+                            if not _rep_norm2 or _rep_norm2 == _rep_cand2:
+                                _rep_norm2 = COUNTRY_NORMALIZE.get(_rep_cand2.lower(), '')
+                            if _rep_norm2 and get_country_code(_rep_norm2):
+                                setcol(idx, 'country', _rep_norm2); cou = _rep_norm2
+
+        # ── 12. Fix CITY = country name ───────────────────────────
+        cty_now = str(df.at[idx,C('city')] if C('city') else '').strip()
+        if cty_now and COUNTRY_RE.fullmatch(cty_now):
+            if not cou:
+                norm = normalize_country(cty_now)
+                setcol(idx,'country',norm); cou=norm
+            setcol(idx,'city','')
+
+        # ── 12b. Scan all columns for country name when COUNTRY is blank ──────
+        cou_now = str(df.at[idx,C('country')] if C('country') else '').strip()
+        if not cou_now:
+            scan_cols = [
+                C('address'), C('address2'), C('address3'),
+                C('state'), C('city'), C('postal')
+            ]
+            for _col in scan_cols:
+                if not _col: continue
+                _val = str(df.at[idx, _col] if _col in df.columns else '').strip()
+                if not _val: continue
+                # Check if the whole value is a country name
+                _val_stripped = re.sub(r'[.,]+$', '', _val).strip()
+                if COUNTRY_RE.search(_val_stripped) and re.fullmatch(COUNTRY_RE.pattern, _val_stripped, re.I):
+                    _norm = normalize_country(_val_stripped)
+                    record(idx, 'country', '', _norm)
+                    setcol(idx, 'country', _norm); cou = _norm
+                    # Clear the source column only if it contained ONLY the country name
+                    if _val_stripped.lower() == _norm.lower() or _val_stripped.lower() in COUNTRY_NORMALIZE:
+                        if _col != C('address'):  # never wipe ADDRESS1
+                            df.at[idx, _col] = ''
+                    break
+                # Also check: does the value END with a country name after a comma?
+                _parts = [p.strip() for p in _val.split(',')]
+                for _p in reversed(_parts):
+                    _p_stripped = re.sub(r'[.,]+$', '', _p).strip()
+                    if (COUNTRY_RE.search(_p_stripped) and
+                            re.fullmatch(COUNTRY_RE.pattern, _p_stripped, re.I) and
+                            not ADDR_RE.search(_p_stripped)):
+                        _norm = normalize_country(_p_stripped)
+                        record(idx, 'country', '', _norm)
+                        setcol(idx, 'country', _norm); cou = _norm
+                        break
+                if cou: break
+
+        # ── 13. Infer COUNTRY if missing ──────────────────────────
+        if o_infer:
+            cou_now = str(df.at[idx,C('country')] if C('country') else '').strip()
+            if not cou_now:
+                inferred = infer_country(
+                    str(df.at[idx,C('city')]  if C('city')  else ''),
+                    str(df.at[idx,C('state')] if C('state') else ''),
+                    str(df.at[idx,C('postal')]if C('postal')else ''),
+                )
+                if inferred:
+                    setcol(idx,'country',inferred); cou=inferred
+
+        # ── 14. Fill COUNTRY_ID ───────────────────────────────────
+        fc = str(df.at[idx,C('country')] if C('country') else '').strip()
+        fi = str(df.at[idx,C('country_id')] if C('country_id') else '').strip()
+        if C('country_id'):
+            if fi and not ISO2_RE.match(fi):
+                # COUNTRY_ID has a full name (e.g. 'Egypt') → convert to ISO code
+                code = get_country_code(fi)
+                if not code and fc: code = get_country_code(fc)
+                if code: setcol(idx,'country_id',code); fi=code
+            elif fc and not fi:
+                # COUNTRY_ID is empty → fill from COUNTRY
+                code = get_country_code(fc)
+                if code: setcol(idx,'country_id',code)
+
+        # ── 15. Postal validation ─────────────────────────────────
+        if o_postal and C('postal'):
+            df.at[idx,'POSTAL_FLAG'] = validate_postal(
+                str(df.at[idx,C('postal')]).strip(),
+                str(df.at[idx,C('country')] if C('country') else '').strip()
+            )
+
+        # ── 16. Data quality ──────────────────────────────────────
+        if o_quality:
+            df.at[idx,'DATA_QUALITY'] = data_quality(row, col_map)
+
+    prog.progress(1.0, text="Complete!")
+    st.session_state['cleaned_df'] = df
+    st.session_state['diffs']      = diffs
+    st.session_state['col_map']    = col_map
+
+# ── Show results ──────────────────────────────────────────────────
+if 'cleaned_df' in st.session_state:
+    df      = st.session_state['cleaned_df']
+    diffs   = st.session_state['diffs']
+    col_map = st.session_state['col_map']
+    n = len(df)
+
+    complete = (df.get('DATA_QUALITY','')=='COMPLETE').sum() if 'DATA_QUALITY' in df.columns else 0
+    partial  = (df.get('DATA_QUALITY','')=='PARTIAL').sum()  if 'DATA_QUALITY' in df.columns else 0
+    missing  = (df.get('DATA_QUALITY','')=='MISSING').sum()  if 'DATA_QUALITY' in df.columns else 0
+    invalid  = (df.get('POSTAL_FLAG','')=='INVALID').sum()   if 'POSTAL_FLAG'  in df.columns else 0
+
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    c1.metric("Rows",         f"{n:,}")
+    c2.metric("Changes",      f"{len(diffs):,}")
+    c3.metric("Complete",     f"{complete:,}", f"{round(complete/n*100) if n else 0}%")
+    c4.metric("Partial",      f"{partial:,}",  f"{round(partial/n*100)  if n else 0}%")
+    c5.metric("Missing",      f"{missing:,}",  f"{round(missing/n*100)  if n else 0}%")
+    c6.metric("Invalid postal",f"{invalid:,}")
+
+    tab1,tab2,tab3 = st.tabs(["📋 Cleaned Data","🔍 Changes","⬇️ Download"])
+
+    with tab1:
+        st.dataframe(df, use_container_width=True, height=500)
+
+    with tab2:
+        if diffs:
+            st.dataframe(pd.DataFrame(diffs), use_container_width=True, height=400)
+        else:
+            st.info("No changes recorded")
+
+    with tab3:
+        st.subheader("Download cleaned file")
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as w:
+            df.to_excel(w, sheet_name='Cleaned Data', index=False)
+            if diffs:
+                pd.DataFrame(diffs).to_excel(w, sheet_name='Changes Log', index=False)
+        st.download_button(
+            "⬇️  Download Cleaned Excel",
+            data=buf.getvalue(),
+            file_name="cleaned_addresses.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary"
+        )
