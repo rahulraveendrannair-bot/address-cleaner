@@ -1198,6 +1198,205 @@ if not run and 'cleaned_df' not in st.session_state:
     st.caption(f"Showing 30 of {len(df_raw):,} rows")
     st.stop()
 
+def validate_pass2(df, col_map, diffs, CITY_TO_COUNTRY, COUNTRY_TO_CODE,
+                   STATE_KW, ADDR_RE, COUNTRY_RE, KNOWN_STATES,
+                   validate_postal, normalize_country, get_country_code,
+                   parse_city_field, split_state_hierarchy,
+                   extraction_confidence, PO_BOX_RE, ISO_TO_COUNTRY,
+                   JUNK_POSTAL, UK_POST_RE):
+    """Second-pass validator: re-checks every row for issues the first pass missed."""
+    import re
+
+    def C(f):
+        v = col_map.get(f, '')
+        return v if v and v in df.columns else None
+
+    def get(idx, field):
+        c = C(field)
+        return str(df.at[idx, c]).strip() if c and c in df.columns else ''
+
+    def flag(idx, reason):
+        if 'EXCEPTION_FLAG' not in df.columns:
+            return
+        cur = str(df.at[idx, 'EXCEPTION_FLAG']).strip()
+        if cur in ('', 'nan', 'NaN'):
+            df.at[idx, 'EXCEPTION_FLAG'] = reason
+        elif reason not in cur:
+            df.at[idx, 'EXCEPTION_FLAG'] = cur + '; ' + reason
+
+    def put_addr(idx, val):
+        """Place val in next available address field A1→A2→A3."""
+        for af in ['address', 'address2', 'address3']:
+            c = C(af)
+            if c:
+                ev = str(df.at[idx, c]).strip()
+                if not ev or ev in ('nan', ''):
+                    df.at[idx, c] = val
+                    diffs.append({'Row': idx+1, 'Field': c,
+                                  'Before': '', 'After': val, 'Pass': 'validation-2'})
+                    return True
+        return False
+
+    issues_found = 0
+
+    for idx in range(len(df)):
+        a1  = get(idx, 'address')
+        a2  = get(idx, 'address2')
+        a3  = get(idx, 'address3')
+        cty = get(idx, 'city')
+        st  = get(idx, 'state')
+        pst = get(idx, 'postal')
+        cou = get(idx, 'country')
+        cid = get(idx, 'country_id')
+
+        # V1: STATE still contains commas (unsplit multi-value) ──────────────
+        if st and ',' in st:
+            parts = [p.strip() for p in st.split(',') if p.strip()]
+            has_non_kw = any(not STATE_KW.search(p) for p in parts)
+            new_st2, new_a3_2 = split_state_hierarchy(st)
+            if new_a3_2 and new_st2 != st:
+                old_st = st
+                if C('state'):
+                    df.at[idx, C('state')] = new_st2
+                    diffs.append({'Row': idx+1, 'Field': 'STATE',
+                                  'Before': old_st, 'After': new_st2, 'Pass': 'validation-2'})
+                if new_a3_2 and C('address3'):
+                    ex = get(idx, 'address3')
+                    merged = ((ex + ', ' + new_a3_2) if ex else new_a3_2).strip(', ')
+                    df.at[idx, C('address3')] = merged
+                st = new_st2
+                issues_found += 1
+            elif has_non_kw:
+                pc_city2, pc_state2, pc_a3_2 = parse_city_field(st)
+                if pc_state2 and pc_state2 != st:
+                    old_st = st
+                    if C('state'):
+                        df.at[idx, C('state')] = pc_state2
+                        diffs.append({'Row': idx+1, 'Field': 'STATE',
+                                      'Before': old_st, 'After': pc_state2, 'Pass': 'validation-2'})
+                    st = pc_state2
+                    if not cty and pc_city2 and C('city'):
+                        df.at[idx, C('city')] = pc_city2
+                        cty = pc_city2
+                    elif cty and pc_city2:
+                        non_st = ', '.join(p for p in [pc_city2, pc_a3_2] if p)
+                        if non_st:
+                            if not a1 and C('address'):
+                                df.at[idx, C('address')] = non_st
+                            elif not a2 and C('address2'):
+                                df.at[idx, C('address2')] = non_st
+                    if pc_a3_2 and C('address3') and not cty:
+                        ex = get(idx, 'address3')
+                        if not ex:
+                            df.at[idx, C('address3')] = pc_a3_2
+                    issues_found += 1
+
+        # V2: CITY contains a state keyword ──────────────────────────────────
+        if cty and STATE_KW.search(cty) and not re.match(r'^\d', cty):
+            if not st and C('state'):
+                df.at[idx, C('state')] = cty
+                diffs.append({'Row': idx+1, 'Field': 'CITY→STATE',
+                              'Before': cty, 'After': cty, 'Pass': 'validation-2'})
+                if C('city'):
+                    df.at[idx, C('city')] = ''
+                flag(idx, 'V2_CITY_WAS_STATE')
+            else:
+                if not put_addr(idx, cty):
+                    flag(idx, 'V2_CITY_HAS_STATE_KW_REVIEW')
+                if C('city'):
+                    df.at[idx, C('city')] = ''
+            cty = get(idx, 'city')
+            issues_found += 1
+
+        # V3: CITY is pure digits ─────────────────────────────────────────────
+        if cty and re.match(r'^\d{4,7}$', cty):
+            if not pst and C('postal'):
+                df.at[idx, C('postal')] = cty
+                pst = cty
+                diffs.append({'Row': idx+1, 'Field': 'CITY→POSTAL',
+                              'Before': cty, 'After': cty, 'Pass': 'validation-2'})
+                if C('city'):
+                    df.at[idx, C('city')] = ''
+                cty = ''
+                flag(idx, 'V3_CITY_WAS_POSTAL')
+                issues_found += 1
+
+        # V4: POSTAL format invalid for country ───────────────────────────────
+        if pst and C('postal') and not JUNK_POSTAL.match(pst):
+            pflag = validate_postal(pst, cou)
+            if pflag == 'INVALID':
+                if pst.lower() in CITY_TO_COUNTRY and not cty and C('city'):
+                    df.at[idx, C('city')] = pst
+                    cty = pst
+                    df.at[idx, C('postal')] = ''
+                    pst = ''
+                    flag(idx, 'V4_POSTAL_WAS_CITY')
+                elif STATE_KW.search(pst) and not st and C('state'):
+                    df.at[idx, C('state')] = pst
+                    st = pst
+                    df.at[idx, C('postal')] = ''
+                    pst = ''
+                    flag(idx, 'V4_POSTAL_WAS_STATE')
+                else:
+                    if put_addr(idx, pst):
+                        df.at[idx, C('postal')] = ''
+                        pst = ''
+                        flag(idx, 'V4_INVALID_POSTAL_MOVED')
+                    else:
+                        flag(idx, 'V4_INVALID_POSTAL_REVIEW')
+                issues_found += 1
+
+        # V5: COUNTRY_ID doesn't match COUNTRY ────────────────────────────────
+        if cou and cid and C('country_id'):
+            expected_id = get_country_code(cou)
+            if not expected_id:
+                norm = normalize_country(cou)
+                expected_id = get_country_code(norm)
+            if expected_id and cid != expected_id:
+                df.at[idx, C('country_id')] = expected_id
+                diffs.append({'Row': idx+1, 'Field': 'COUNTRY_ID',
+                              'Before': cid, 'After': expected_id, 'Pass': 'validation-2'})
+                flag(idx, 'V5_COUNTRY_ID_CORRECTED')
+                issues_found += 1
+
+        # V6: Address field IS a country name with COUNTRY blank ──────────────
+        if not cou:
+            for af in ['address', 'address2', 'address3']:
+                av = get(idx, af)
+                if av and COUNTRY_RE.fullmatch(av.strip()):
+                    norm = normalize_country(av.strip())
+                    if norm and C('country'):
+                        df.at[idx, C('country')] = norm
+                        cou = norm
+                        if C(af):
+                            df.at[idx, C(af)] = ''
+                        diffs.append({'Row': idx+1, 'Field': f'{af}→COUNTRY',
+                                      'Before': av, 'After': norm, 'Pass': 'validation-2'})
+                        issues_found += 1
+                        break
+
+        # V7: Valid postal sitting in an address field ────────────────────────
+        if not pst and C('postal'):
+            a1_now = get(idx, 'address')
+            for af in ['address2', 'address3']:
+                av = get(idx, af)
+                if av and re.match(r'^\d{4,7}$', av) and not PO_BOX_RE.search(a1_now):
+                    conf = extraction_confidence(av, 'postal')
+                    if conf in ('HIGH', 'MEDIUM'):
+                        df.at[idx, C('postal')] = av
+                        pst = av
+                        if C(af):
+                            df.at[idx, C(af)] = ''
+                        diffs.append({'Row': idx+1, 'Field': f'{af}→POSTAL',
+                                      'Before': av, 'After': av, 'Pass': 'validation-2'})
+                        flag(idx, 'V7_POSTAL_FROM_ADDR')
+                        issues_found += 1
+                        break
+
+    return issues_found
+
+
+
 if run:
     df     = df_raw.copy()
     diffs  = []
@@ -1394,12 +1593,11 @@ if run:
                 _cty_now = str(df.at[idx,C('city')] if C('city') else '').strip()
                 _pc_city, _pc_state, _pc_a3 = parse_city_field(st_now)
                 if _has_non_kw and _pc_state and _pc_state != st_now:
-                    # Only split if CITY is blank — if already populated, leave STATE as-is
-                    if _cty_now:
-                        pass  # don't move — CITY already has a value
-                    else:
-                        record(idx,'state',st_now,_pc_state)
-                        setcol(idx,'state',_pc_state); st_=_pc_state
+                    # Always split STATE: put province/dept in STATE
+                    record(idx,'state',st_now,_pc_state)
+                    setcol(idx,'state',_pc_state); st_=_pc_state
+                    if not _cty_now:
+                        # CITY blank — write extracted city, put sub-locality in ADDRESS3
                         if _pc_city and C('city'):
                             record(idx,'city','',_pc_city)
                             setcol(idx,'city',_pc_city); cty=_pc_city
@@ -1407,6 +1605,20 @@ if run:
                             _ex_a3 = str(df.at[idx,C('address3')] if C('address3') else '').strip()
                             _merged = ((_ex_a3 + ', ' + _pc_a3) if _ex_a3 else _pc_a3).strip(', ')
                             setcol(idx,'address3',_merged)
+                    else:
+                        # CITY already set — move non-state parts to ADDRESS1
+                        # e.g. 'Cove, Houen-Hounso, Zou Dept' → A1='Cove, Houen-Hounso'
+                        _non_state = ', '.join(p for p in [_pc_city, _pc_a3] if p).strip(', ')
+                        if _non_state and C('address'):
+                            _ex_a1 = str(df.at[idx,C('address')] if C('address') else '').strip()
+                            if not _ex_a1:
+                                record(idx,'address','',_non_state)
+                                setcol(idx,'address',_non_state)
+                            else:
+                                # A1 already has content — prepend
+                                _merged_a1 = _non_state + ', ' + _ex_a1
+                                record(idx,'address',_ex_a1,_merged_a1)
+                                setcol(idx,'address',_merged_a1)
 
         # ── 9. Parse CITY field ───────────────────────────────────
         if cty:
@@ -1463,8 +1675,15 @@ if run:
 
         # ── 11. Parse ADDRESS1 ────────────────────────────────────
         if a1 and not NOTE_RE.match(a1):
-            # Clear CITY if it equals raw ADDRESS1 (bug from earlier)
+            # Clear CITY if it duplicates ADDRESS1 or contains street keywords
             if cty and (cty == a1 or ADDR_RE.search(cty)):
+                if cty != a1:  # not a duplicate — preserve in A2/A3 before clearing
+                    _cty_dup_placed = False
+                    for _cd_af in ['address2','address3']:
+                        _cd_av = str(df.at[idx,C(_cd_af)] if C(_cd_af) else '').strip()
+                        if C(_cd_af) and not _cd_av:
+                            setcol(idx,_cd_af,cty)
+                            _cty_dup_placed = True; break
                 setcol(idx,'city',''); cty=''
 
             # Always pass empty pre-sets so strip_tail cleans A1 fully.
@@ -1487,7 +1706,15 @@ if run:
                     record(idx,'city','',new_city)
                     setcol(idx,'city',new_city); cty=new_city
                 else:
-                    df.at[idx,'EXCEPTION_FLAG'] = 'LOW_CONF_CITY_SKIPPED'
+                    # Low confidence — can't validate, preserve in ADDRESS2/3
+                    _lc_put = False
+                    for _lc_af in ['address2','address3']:
+                        _lc_av = str(df.at[idx,C(_lc_af)] if C(_lc_af) else '').strip()
+                        if C(_lc_af) and not _lc_av:
+                            record(idx,_lc_af,'',new_city)
+                            setcol(idx,_lc_af,new_city)
+                            _lc_put = True; break
+                    df.at[idx,'EXCEPTION_FLAG'] = 'UNVALIDATED_CITY_IN_ADDR' if _lc_put else 'LOW_CONF_CITY_SKIPPED'
             # If CITY already populated, don't move extracted city anywhere — leave A1 intact
             elif new_city and cty and new_city.lower() != cty.lower():
                 pass  # CITY already has a value — don't overwrite or redirect
@@ -1497,7 +1724,15 @@ if run:
                     record(idx,'postal','',new_postal)
                     setcol(idx,'postal',new_postal); pst=new_postal
                 else:
-                    df.at[idx,'EXCEPTION_FLAG'] = 'LOW_CONF_POSTAL_SKIPPED'
+                    # Low confidence — can't validate, preserve in ADDRESS2/3
+                    _lp_put = False
+                    for _lp_af in ['address2','address3']:
+                        _lp_av = str(df.at[idx,C(_lp_af)] if C(_lp_af) else '').strip()
+                        if C(_lp_af) and not _lp_av:
+                            record(idx,_lp_af,'',new_postal)
+                            setcol(idx,_lp_af,new_postal)
+                            _lp_put = True; break
+                    df.at[idx,'EXCEPTION_FLAG'] = 'UNVALIDATED_POSTAL_IN_ADDR' if _lp_put else 'LOW_CONF_POSTAL_SKIPPED'
 
             if new_country and not cou:
                 norm = normalize_country(new_country)
@@ -1517,7 +1752,14 @@ if run:
             if not cou:
                 norm = normalize_country(cty_now)
                 setcol(idx,'country',norm); cou=norm
-            setcol(idx,'city','')
+                setcol(idx,'city','')
+            else:
+                # COUNTRY already set — city value is a country name but can't go to COUNTRY
+                # Preserve in ADDRESS3 rather than discard
+                _ex_cty_a3 = str(df.at[idx,C('address3')] if C('address3') else '').strip()
+                if C('address3') and not _ex_cty_a3:
+                    setcol(idx,'address3',cty_now)
+                setcol(idx,'city','')
 
         # ── 12b. Scan all columns for country name when COUNTRY is blank ──────
         cou_now = str(df.at[idx,C('country')] if C('country') else '').strip()
@@ -1571,12 +1813,15 @@ if run:
                     setcol(idx,'city','')
                     df.at[idx,'EXCEPTION_FLAG'] = 'CITY_WAS_STATE'
                 elif _st_12c != _cty_12c:
-                    # State already populated — move city to ADDRESS3
-                    _ex_a3c = str(df.at[idx,C('address3')] if C('address3') else '').strip()
-                    if C('address3') and not _ex_a3c:
-                        setcol(idx,'address3',_cty_12c)
+                    # State already populated — move city to ADDRESS3, fallback ADDRESS2
+                    _12c_placed = False
+                    for _12c_af in ['address3','address2']:
+                        _12c_av = str(df.at[idx,C(_12c_af)] if C(_12c_af) else '').strip()
+                        if C(_12c_af) and not _12c_av:
+                            setcol(idx,_12c_af,_cty_12c)
+                            _12c_placed = True; break
                     setcol(idx,'city','')
-                    df.at[idx,'EXCEPTION_FLAG'] = 'CITY_WAS_STATE_MOVED_A3'
+                    df.at[idx,'EXCEPTION_FLAG'] = 'CITY_WAS_STATE_MOVED_A3' if _12c_placed else 'CITY_WAS_STATE_NO_SPACE'
             # If city is actually a postal code
             elif _is_postal:
                 if not _pst_12c:
@@ -1637,15 +1882,20 @@ if run:
                     setcol(idx,'postal','')
                     df.at[idx,'POSTAL_FLAG'] = 'MOVED_TO_STATE'
                     df.at[idx,'EXCEPTION_FLAG'] = 'POSTAL_WAS_STATE'
-                # Not reclassifiable — preserve in ADDRESS2 (no data loss)
-                elif C('address2') and not str(df.at[idx,C('address2')] if C('address2') else '').strip():
-                    setcol(idx,'address2',_pst_val)
-                    setcol(idx,'postal','')
-                    df.at[idx,'POSTAL_FLAG'] = 'MOVED_TO_A2'
-                    df.at[idx,'EXCEPTION_FLAG'] = 'POSTAL_INVALID_PRESERVED'
+                # Not reclassifiable — try ADDRESS2, ADDRESS3, then flag
                 else:
-                    # Keep in postal but flag for review
-                    df.at[idx,'EXCEPTION_FLAG'] = 'POSTAL_INVALID_REVIEW'
+                    _pst_placed = False
+                    for _pst_af in ['address2','address3']:
+                        _pst_av = str(df.at[idx,C(_pst_af)] if C(_pst_af) else '').strip()
+                        if C(_pst_af) and not _pst_av:
+                            setcol(idx,_pst_af,_pst_val)
+                            setcol(idx,'postal','')
+                            df.at[idx,'POSTAL_FLAG'] = f'MOVED_TO_{_pst_af.upper()}'
+                            df.at[idx,'EXCEPTION_FLAG'] = 'POSTAL_INVALID_PRESERVED'
+                            _pst_placed = True; break
+                    if not _pst_placed:
+                        # All address fields occupied — keep in POSTAL, flag for review
+                        df.at[idx,'EXCEPTION_FLAG'] = 'POSTAL_INVALID_REVIEW'
 
         # ── 16. Data quality ──────────────────────────────────────
         if o_quality:
@@ -1656,7 +1906,25 @@ if run:
         if str(df.at[idx,'EXCEPTION_FLAG']) in ('', 'nan', 'NaN'):
             df.at[idx,'EXCEPTION_FLAG'] = ''
 
-    prog.progress(1.0, text="Complete!")
+    # ── Second-pass validation ────────────────────────────────────────────
+    prog.progress(0.92, text="Pass 2: re-validating cleaned data…")
+    issues_p2 = validate_pass2(
+        df, col_map, diffs, CITY_TO_COUNTRY, COUNTRY_TO_CODE,
+        STATE_KW, ADDR_RE, COUNTRY_RE, KNOWN_STATES,
+        validate_postal, normalize_country, get_country_code,
+        parse_city_field, split_state_hierarchy,
+        extraction_confidence, PO_BOX_RE, ISO_TO_COUNTRY,
+        JUNK_POSTAL, UK_POST_RE
+    )
+    # ── Third pass: re-run data quality scores after corrections ─────────
+    prog.progress(0.97, text="Pass 3: re-scoring data quality…")
+    if o_quality:
+        for idx, row in df.iterrows():
+            df.at[idx,'DATA_QUALITY'] = data_quality(row, col_map)
+    # Ensure EXCEPTION_FLAG is clean (no nan)
+    if 'EXCEPTION_FLAG' in df.columns:
+        df['EXCEPTION_FLAG'] = df['EXCEPTION_FLAG'].replace({'nan':'','NaN':''}).fillna('')
+    prog.progress(1.0, text=f"Complete! ({issues_p2} issues corrected in pass 2)")
     st.session_state['cleaned_df'] = df
     st.session_state['diffs']      = diffs
     st.session_state['col_map']    = col_map
