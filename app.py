@@ -1360,7 +1360,8 @@ def validate_pass2(df, col_map, diffs, CITY_TO_COUNTRY, COUNTRY_TO_CODE,
                         if non_st:
                             if not a1 and C('address'):
                                 df.at[idx, C('address')] = non_st
-                            elif not a2 and C('address2'):
+                            elif not a2 and C('address2') and non_st != a1:
+                                # Guard: don't duplicate a value already in ADDRESS1
                                 df.at[idx, C('address2')] = non_st
                     if pc_a3_2 and C('address3') and not cty:
                         ex = get(idx, 'address3')
@@ -1816,7 +1817,7 @@ if run:
                 record(idx,'country','',norm)
                 setcol(idx,'country',norm); cou=norm
 
-            if new_a2 and not a2 and C('address2'):
+            if new_a2 and not a2 and C('address2') and new_a2 != a1:
                 setcol(idx,'address2',new_a2)
 
             if new_a3 and C('address3'):
