@@ -1704,7 +1704,23 @@ def validate_pass2(df, col_map, diffs, CITY_TO_COUNTRY, COUNTRY_TO_CODE,
 
         # V2: CITY contains a state keyword ──────────────────────────────────
         if cty and STATE_KW.search(cty) and not re.match(r'^\d', cty):
-            if not st and C('state'):
+            _v2_l2 = re.compile(
+                r'\b(District|County|Borough|Township|Ward|Sub-city|Subcity|'
+                r'Subcounty|Kebele|Woreda|Arrondissement|Rayon|Raion|Commune|'
+                r'Parish|Tehsil|Taluk|Mandal|Upazila|Thana|Zila|'
+                r'Neighbourhood|Neighborhood|Quarter)\b', re.I).search(cty)
+            _v2_l1 = re.compile(
+                r'\b(Province|Region|Oblast|Krai|Kray|Prefecture|Governorate|'
+                r'Department|Territory|Okrug|Administrative|Zone|Republic|'
+                r'Voivodeship|Canton|Emirate|Shire|Wilayat|Division|'
+                r'Muhafazah|Area|Sector|Circuit|Cercle|Constituency)\b', re.I).search(cty)
+            if _v2_l2 and not _v2_l1:
+                # Level-2 unit in CITY → move to ADDRESS3
+                if not a3 and C('address3'):
+                    df.at[idx, C('address3')] = cty
+                if C('city'): df.at[idx, C('city')] = ''
+                flag(idx, 'V2_CITY_WAS_DISTRICT_MOVED_A3')
+            elif not st and C('state'):
                 df.at[idx, C('state')] = cty
                 diffs.append({'Row': idx+1, 'Field': 'CITY→STATE',
                               'Before': cty, 'After': cty, 'Pass': 'validation-2'})
@@ -1962,10 +1978,28 @@ if run:
         if a2 and a1 and a2.strip() == a1.strip():
             setcol(idx,'address2',''); a2=''
         if a2:
+            _a2_l2_only = re.compile(
+                r'\b(District|County|Borough|Township|Ward|Sub-city|Subcity|'
+                r'Subcounty|Kebele|Woreda|Arrondissement|Rayon|Raion|Commune|'
+                r'Parish|Tehsil|Taluk|Mandal|Upazila|Thana|Zila|'
+                r'Neighbourhood|Neighborhood|Quarter)\b',re.I).search(a2)
+            _a2_has_l1 = re.compile(
+                r'\b(Province|Region|Oblast|Krai|Kray|Prefecture|Governorate|'
+                r'Department|Territory|Okrug|Administrative|Zone|Republic|'
+                r'Voivodeship|Canton|Emirate|Shire|Wilayat|Division|'
+                r'Muhafazah|Area|Sector|Circuit|Cercle|Constituency)\b',re.I).search(a2)
             if STATE_KW.search(a2) and not ADDR_RE.search(a2) and not st_:
-                record(idx,'state','',a2)
-                setcol(idx,'state',a2); st_=a2
-                setcol(idx,'address2',''); a2=''
+                if _a2_l2_only and not _a2_has_l1:
+                    # Level-2 unit (District/County/etc.) → ADDRESS3, not STATE
+                    _ex_a3b = str(df.at[idx,C('address3')] if C('address3') else '').strip()
+                    if C('address3') and not _ex_a3b:
+                        record(idx,'address3','',a2)
+                        setcol(idx,'address3',a2)
+                    setcol(idx,'address2',''); a2=''
+                else:
+                    record(idx,'state','',a2)
+                    setcol(idx,'state',a2); st_=a2
+                    setcol(idx,'address2',''); a2=''
             elif re.match(r'^\d{4,6}$',a2) and not pst:
                 if extraction_confidence(a2,'postal') in ('HIGH','MEDIUM'):
                     record(idx,'postal','',a2)
@@ -2272,8 +2306,25 @@ if run:
             _has_stkw= bool(STATE_KW.search(_cty_12c))
             _is_postal = bool(re.match(r'^\d{4,7}$', _cty_12c))
             # If city has a state keyword (e.g. 'Krasnodar Oblast') → move to STATE
+            _cty_l2_only = re.compile(
+                r'\b(District|County|Borough|Township|Ward|Sub-city|Subcity|'
+                r'Subcounty|Kebele|Woreda|Arrondissement|Rayon|Rion|Commune|'
+                r'Parish|Tehsil|Taluk|Mandal|Upazila|Thana|Zila|'
+                r'Neighbourhood|Neighborhood|Quarter)\b',re.I).search(_cty_12c)
+            _cty_has_l1 = re.compile(
+                r'\b(Province|Region|Oblast|Krai|Kray|Prefecture|Governorate|'
+                r'Department|Territory|Okrug|Administrative|Zone|Republic|'
+                r'Voivodeship|Canton|Emirate|Shire|Wilayat|Division|'
+                r'Muhafazah|Area|Sector|Circuit|Cercle|Constituency)\b',re.I).search(_cty_12c)
             if _has_stkw and not _is_postal:
-                if not _st_12c:
+                if _cty_l2_only and not _cty_has_l1:
+                    # Level-2 unit → ADDRESS3
+                    _ex_a3c2 = str(df.at[idx,C('address3')] if C('address3') else '').strip()
+                    if C('address3') and not _ex_a3c2:
+                        setcol(idx,'address3',_cty_12c)
+                    setcol(idx,'city','')
+                    df.at[idx,'EXCEPTION_FLAG'] = 'CITY_WAS_DISTRICT_MOVED_A3'
+                elif not _st_12c:
                     record(idx,'state','',_cty_12c)
                     setcol(idx,'state',_cty_12c)
                     setcol(idx,'city','')
@@ -2343,11 +2394,26 @@ if run:
                     df.at[idx,'EXCEPTION_FLAG'] = 'POSTAL_WAS_CITY'
                 # Is it actually a state/region?
                 elif STATE_KW.search(_pst_val) and not str(df.at[idx,C('state')] if C('state') else '').strip():
-                    record(idx,'state','',_pst_val)
-                    setcol(idx,'state',_pst_val)
-                    setcol(idx,'postal','')
-                    df.at[idx,'POSTAL_FLAG'] = 'MOVED_TO_STATE'
-                    df.at[idx,'EXCEPTION_FLAG'] = 'POSTAL_WAS_STATE'
+                    _pst_l2 = re.compile(
+                        r'\b(District|County|Borough|Township|Ward|Sub-city|'
+                        r'Subcounty|Kebele|Woreda|Rayon|Commune|Parish|'
+                        r'Tehsil|Taluk|Mandal|Upazila|Thana|Zila)\b',re.I).search(_pst_val)
+                    _pst_l1 = re.compile(
+                        r'\b(Province|Region|Oblast|Krai|Prefecture|Governorate|'
+                        r'Department|Territory|Administrative|Zone)\b',re.I).search(_pst_val)
+                    if _pst_l2 and not _pst_l1:
+                        # Level-2 → ADDRESS3
+                        _ex_a3p = str(df.at[idx,C('address3')] if C('address3') else '').strip()
+                        if C('address3') and not _ex_a3p:
+                            setcol(idx,'address3',_pst_val)
+                        setcol(idx,'postal','')
+                        df.at[idx,'POSTAL_FLAG'] = 'MOVED_TO_ADDRESS3'
+                    else:
+                        record(idx,'state','',_pst_val)
+                        setcol(idx,'state',_pst_val)
+                        setcol(idx,'postal','')
+                        df.at[idx,'POSTAL_FLAG'] = 'MOVED_TO_STATE'
+                        df.at[idx,'EXCEPTION_FLAG'] = 'POSTAL_WAS_STATE'
                 # Not reclassifiable — try ADDRESS2, ADDRESS3, then flag
                 else:
                     _pst_placed = False
