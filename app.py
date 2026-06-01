@@ -1276,8 +1276,7 @@ with st.sidebar:
     geo_verify = st.toggle(
         "🌐 Geo-verify ambiguous places",
         value=False,
-        help="Uses AI + web search to verify unknown city/state/district names. "
-             "More accurate but slower (adds ~1–3s per ambiguous row)."
+        help="Looks up unknown place names on OpenStreetMap (Nominatim), then Falling Rain as fallback. Adds ~1–2s per ambiguous row."
     )
 
     run = st.button(
@@ -1298,92 +1297,109 @@ if not run and 'cleaned_df' not in st.session_state:
 
 import requests, json, re, time
 
-_geo_cache = {}
+# ── Geo-lookup: OpenStreetMap (Nominatim) primary, Falling Rain fallback ─────
+# Rules:
+#   1. OSM is always tried first; result validated before fallback is triggered
+#   2. Falling Rain is used ONLY when OSM returns nothing or fails validation
+#   3. Data from the two sources is NEVER mixed within a single record
+#   4. Every fallback is logged with a reason (GEO_LOG)
+#   5. Unresolved cases are explicitly flagged as GEO_UNRESOLVED
+#
+# Source field values:
+#   'osm'          – OpenStreetMap / Nominatim
+#   'fallingrain'  – Falling Rain gazetteer
+#   'static'       – agent's own static lookup lists
+#   'unresolved'   – place could not be classified
 
-_NOMINATIM_TYPE_MAP = {
-    'city':'city','town':'city','village':'city','hamlet':'city',
-    'municipality':'city','suburb':'city','quarter':'city',
-    'state':'state','province':'state','region':'state',
-    'department':'state','prefecture':'state','autonomous_region':'state',
-    'county':'district','district':'district','borough':'district',
-    'neighbourhood':'district','suburb':'district',
-    'country':'country',
+_geo_cache = {}   # (place_lower, country_lower) → result dict
+GEO_LOG    = []   # audit log of every lookup + fallback reason
+
+_OSM_TYPE_MAP = {
+    'city':         'city',   'town':          'city',
+    'village':      'city',   'hamlet':        'city',
+    'municipality': 'city',   'suburb':        'city',
+    'quarter':      'city',   'locality':      'city',
+    'state':        'state',  'province':      'state',
+    'region':       'state',  'department':    'state',
+    'prefecture':   'state',  'autonomous_region': 'state',
+    'county':       'district', 'district':    'district',
+    'borough':      'district', 'neighbourhood':'district',
+    'country':      'country',
 }
 
+def _validate_osm_result(result, place_name):
+    """
+    Validate an OSM result before accepting it.
+    Returns (is_valid, reason_if_invalid).
+    """
+    if not result:
+        return False, "empty result"
+    if result.get('type') == 'unknown':
+        return False, "OSM returned unknown type"
+    display = result.get('note', '')
+    if display and place_name.lower() not in display.lower():
+        # Name mismatch — OSM returned something unrelated
+        return False, f"name mismatch: searched '{place_name}', got '{display[:60]}'"
+    if not result.get('country'):
+        return False, "no country in OSM result"
+    return True, ""
+
 def _nominatim_lookup(place_name, country_hint=''):
-    """Query Nominatim (OpenStreetMap) — free, no key required."""
-    import urllib.parse, json
+    """Query Nominatim (OpenStreetMap). Returns structured result or None."""
+    import urllib.parse
     params = {
-        'q': place_name + (' ' + country_hint if country_hint else ''),
-        'format': 'json',
+        'q':              (place_name + (' ' + country_hint if country_hint else '')).strip(),
+        'format':         'json',
         'addressdetails': '1',
-        'limit': '3',
+        'limit':          '3',
+        'accept-language':'en',
     }
     url = 'https://nominatim.openstreetmap.org/search?' + urllib.parse.urlencode(params)
     try:
-        r = requests.get(url, timeout=8,
-                         headers={'User-Agent': 'address-cleaner-app/1.0 contact@example.com'})
+        r = requests.get(url, timeout=10,
+                         headers={'User-Agent': 'address-cleaner-app/1.0'})
         r.raise_for_status()
         results = r.json()
         if not results:
             return None
-        best = results[0]
-        addr = best.get('address', {})
-        osm_type = (best.get('addresstype') or best.get('type') or '').lower()
-        place_type = _NOMINATIM_TYPE_MAP.get(osm_type, 'unknown')
-        # Fallback: check class + type combo
+        # Pick best match: prefer exact name match, then first result
+        best = None
+        for res in results[:3]:
+            name_in_display = place_name.lower() in res.get('display_name', '').lower()
+            if name_in_display:
+                best = res
+                break
+        if not best:
+            best = results[0]
+
+        addr       = best.get('address', {})
+        osm_type   = (best.get('addresstype') or best.get('type') or '').lower()
+        place_type = _OSM_TYPE_MAP.get(osm_type, 'unknown')
+        # Fallback type detection from class
         if place_type == 'unknown' and best.get('class') == 'place':
-            place_type = _NOMINATIM_TYPE_MAP.get(best.get('type','').lower(), 'unknown')
+            place_type = _OSM_TYPE_MAP.get(best.get('type', '').lower(), 'unknown')
+
         state   = (addr.get('state') or addr.get('region') or
-                   addr.get('province') or addr.get('department') or '')
+                   addr.get('province') or addr.get('department') or
+                   addr.get('county') or '')
         country = addr.get('country', '')
+
         return {
             'type':       place_type,
             'state':      state,
             'country':    country,
             'confidence': 'high' if place_type != 'unknown' else 'medium',
-            'note':       best.get('display_name', '')[:120],
-            'source':     'nominatim',
+            'note':       best.get('display_name', '')[:150],
+            'source':     'osm',
+            'osm_id':     str(best.get('osm_id', '')),
         }
-    except Exception:
-        return None
-
-
-def _fallingrain_lookup(place_name, country_hint=''):
-    """Search fallingrain.com/world and parse the HTML result."""
-    import urllib.parse, re
-    query = urllib.parse.quote(place_name + (' ' + country_hint if country_hint else ''))
-    url = f'https://www.fallingrain.com/world/search.cgi?searchterm={query}'
-    try:
-        r = requests.get(url, timeout=8, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.fallingrain.com/world/',
-        })
-        r.raise_for_status()
-        html = r.text
-        # Find first result link with description
-        # Pattern: href="/world/XX/NN/PlaceName.html">PlaceName</a> ... description
-        m = re.search(
-            r'href="(/world/([A-Z]{2})/\d+/[^"]+\.html)">([^<]+)</a>[^<]*<br[^>]*>([^<]*)',
-            html
-        )
-        if not m:
-            return None
-        path, cc, name, desc = m.group(1), m.group(2), m.group(3), m.group(4).strip()
-        # Parse the description text with parse_fr_snippet
-        snippet = f"{name} {desc}"
-        parsed = parse_fr_snippet(snippet)
-        parsed['confidence'] = 'high' if parsed['type'] != 'unknown' else 'medium'
-        parsed['source'] = 'fallingrain'
-        return parsed
-    except Exception:
-        return None
+    except Exception as exc:
+        return {'type': 'unknown', 'state': '', 'country': '',
+                'confidence': 'low', 'note': str(exc), 'source': 'osm_error'}
 
 
 def parse_fr_snippet(snippet):
-    """Extract (type, state, country) from a Falling Rain description snippet."""
+    """Parse a Falling Rain description: 'Nikki is a city in Borgou Dept in Benin.'"""
     import re
     result = {'type': 'unknown', 'state': '', 'country': ''}
     if not snippet:
@@ -1408,26 +1424,116 @@ def parse_fr_snippet(snippet):
     return result
 
 
+def _fallingrain_lookup(place_name, country_hint=''):
+    """Search fallingrain.com/world. Returns structured result or None."""
+    import urllib.parse, re
+    query = urllib.parse.quote(
+        (place_name + (' ' + country_hint if country_hint else '')).strip()
+    )
+    url = f'https://www.fallingrain.com/world/search.cgi?searchterm={query}'
+    try:
+        r = requests.get(url, timeout=10, headers={
+            'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer':         'https://www.fallingrain.com/world/',
+        })
+        r.raise_for_status()
+        html = r.text
+        # Extract first result: href + name + description
+        m = re.search(
+            r'href="(/world/([A-Z]{2})/\d+/[^"]+\.html)">([^<]+)</a>[^<]*<br[^>]*>([^<]*)',
+            html
+        )
+        if not m:
+            return None
+        path, cc, name, desc = m.group(1), m.group(2), m.group(3).strip(), m.group(4).strip()
+        # Validate: returned name should match what we searched
+        if place_name.lower() not in name.lower():
+            return {'type': 'unknown', 'state': '', 'country': '',
+                    'confidence': 'low',
+                    'note': f'name mismatch: searched {place_name!r}, got {name!r}',
+                    'source': 'fallingrain_mismatch'}
+        parsed = parse_fr_snippet(f"{name} {desc}")
+        parsed['confidence'] = 'high' if parsed['type'] != 'unknown' else 'medium'
+        parsed['source']     = 'fallingrain'
+        parsed['note']       = f"{name} {desc}"[:150]
+        parsed['fr_path']    = path
+        return parsed
+    except Exception as exc:
+        return {'type': 'unknown', 'state': '', 'country': '',
+                'confidence': 'low', 'note': str(exc), 'source': 'fallingrain_error'}
+
+
 def geo_lookup(place_name, country_hint=''):
     """
-    Classify a place name using:
-      1. Nominatim (OpenStreetMap) — free, no key, always tried first
-      2. Falling Rain (fallingrain.com/world) — fallback if Nominatim returns nothing
-    Results cached in _geo_cache.
+    Classify a place name.
+
+    Priority:
+      1. OpenStreetMap / Nominatim  — always tried first
+      2. Falling Rain               — used ONLY if OSM fails validation
+
+    Guarantees:
+      - OSM result is validated before fallback is triggered
+      - Data from OSM and Falling Rain is NEVER mixed in one record
+      - Every fallback is logged to GEO_LOG with the reason
+      - Unresolved cases carry source='unresolved'
     """
     cache_key = (place_name.lower().strip(), country_hint.lower().strip())
     if cache_key in _geo_cache:
         return _geo_cache[cache_key]
 
-    result = _nominatim_lookup(place_name, country_hint)
-    if not result or result.get('type') == 'unknown':
-        fr = _fallingrain_lookup(place_name, country_hint)
-        if fr and fr.get('type') != 'unknown':
-            result = fr
+    log_entry = {
+        'place':        place_name,
+        'country_hint': country_hint,
+        'osm_tried':    False,
+        'osm_valid':    False,
+        'fr_tried':     False,
+        'fr_valid':     False,
+        'final_source': 'unresolved',
+        'fallback_reason': '',
+    }
 
-    if not result:
-        result = {'type': 'unknown', 'state': '', 'country': '',
-                  'confidence': 'low', 'note': 'not found', 'source': 'none'}
+    result = None
+
+    # ── Step 1: OpenStreetMap (Nominatim) ────────────────────────────────────
+    log_entry['osm_tried'] = True
+    osm_raw = _nominatim_lookup(place_name, country_hint)
+    is_valid, invalid_reason = _validate_osm_result(osm_raw, place_name)
+
+    if is_valid:
+        result = osm_raw
+        log_entry['osm_valid']    = True
+        log_entry['final_source'] = 'osm'
+    else:
+        log_entry['fallback_reason'] = f"OSM invalid: {invalid_reason}"
+
+    # ── Step 2: Falling Rain (fallback only if OSM failed validation) ────────
+    if not result or result.get('type') == 'unknown':
+        log_entry['fr_tried'] = True
+        fr_raw = _fallingrain_lookup(place_name, country_hint)
+        if fr_raw and fr_raw.get('type') != 'unknown' and 'mismatch' not in fr_raw.get('source', ''):
+            result = fr_raw   # complete Falling Rain record — no OSM data mixed in
+            log_entry['fr_valid']     = True
+            log_entry['final_source'] = 'fallingrain'
+        else:
+            fr_reason = (fr_raw or {}).get('note', 'no result')
+            log_entry['fallback_reason'] += f" | FR invalid: {fr_reason}"
+
+    # ── Unresolved ────────────────────────────────────────────────────────────
+    if not result or result.get('type') == 'unknown':
+        result = {
+            'type':       'unresolved',
+            'state':      '',
+            'country':    '',
+            'confidence': 'low',
+            'note':       log_entry['fallback_reason'] or 'not found in OSM or Falling Rain',
+            'source':     'unresolved',
+        }
+        log_entry['final_source'] = 'unresolved'
+
+    result['_log'] = log_entry   # attach audit info to result
+    GEO_LOG.append(log_entry)
 
     _geo_cache[cache_key] = result
     return result
@@ -1436,31 +1542,36 @@ def geo_lookup(place_name, country_hint=''):
 def classify_with_geo(place_name, country_hint='',
                       CITY_TO_COUNTRY=None, KNOWN_STATES=None, STATE_KW=None):
     """
-    Full classification: static lists first, then live geo lookup if ambiguous.
-    Returns: (type_str, confidence_str)
+    Full classification with source traceability.
+    Static lists checked first (source='static'), then live geo lookup.
+    Returns: (type_str, confidence_str, source_str)
     """
     p  = place_name.strip()
     pl = p.lower()
 
     if STATE_KW and STATE_KW.search(p):
-        return 'state', 'high'
+        return 'state', 'high', 'static'
     if KNOWN_STATES and pl in KNOWN_STATES and (not CITY_TO_COUNTRY or pl not in CITY_TO_COUNTRY):
-        return 'state', 'high'
+        return 'state', 'high', 'static'
     if CITY_TO_COUNTRY and pl in CITY_TO_COUNTRY:
-        return 'city', 'high'
+        return 'city', 'high', 'static'
 
     result = geo_lookup(p, country_hint)
     geo_type   = result.get('type', 'unknown')
     confidence = result.get('confidence', 'low')
+    source     = result.get('source', 'unresolved')
 
     if geo_type in ('city', 'town', 'municipality', 'village', 'hamlet'):
-        return 'city', confidence
+        return 'city',    confidence, source
     if geo_type in ('state', 'province', 'region', 'prefecture'):
-        return 'state', confidence
+        return 'state',   confidence, source
     if geo_type in ('district', 'county', 'borough'):
-        return 'district', confidence
+        return 'district', confidence, source
+    if geo_type == 'unresolved':
+        return 'unknown', 'low', 'unresolved'
 
-    return 'unknown', 'low'
+    return 'unknown', 'low', source
+
 
 
 def validate_pass2(df, col_map, diffs, CITY_TO_COUNTRY, COUNTRY_TO_CODE,
@@ -1546,26 +1657,34 @@ def validate_pass2(df, col_map, diffs, CITY_TO_COUNTRY, COUNTRY_TO_CODE,
                         if _pc_city_l in CITY_TO_COUNTRY:
                             _place_type, _place_conf = 'city', 'high'
                         elif use_geo_verify:
-                            _place_type, _place_conf = classify_with_geo(
+                            _place_type, _place_conf, _place_src = classify_with_geo(
                                 pc_city2, cou,
                                 CITY_TO_COUNTRY=CITY_TO_COUNTRY,
                                 KNOWN_STATES=KNOWN_STATES,
                                 STATE_KW=STATE_KW
                             )
+                            if _place_src == 'unresolved':
+                                flag(idx, f'GEO_UNRESOLVED:{pc_city2}')
+                            else:
+                                flag(idx, f'GEO_VERIFIED:{_place_src}')
                         else:
-                            _place_type, _place_conf = 'city', 'medium'  # static only
+                            _place_type, _place_conf, _place_src = 'city', 'medium', 'static'
                         if _place_type == 'city' and _place_conf in ('high','medium'):
                             df.at[idx, C('city')] = pc_city2
                             cty = pc_city2
-                            # Cache result for future use
+                            # Cache to static list for this session (source-specific)
                             if _place_conf == 'high' and _pc_city_l not in CITY_TO_COUNTRY:
                                 CITY_TO_COUNTRY[_pc_city_l] = cou or 'Unknown'
                         elif _place_type == 'state' and _place_conf in ('high','medium'):
-                            # Was misclassified — put in STATE not CITY
-                            if not df.at[idx, C('state')] if C('state') else True:
+                            _st_now2 = str(df.at[idx,C('state')] if C('state') else '').strip()
+                            if not _st_now2 and C('state'):
                                 df.at[idx, C('state')] = pc_city2
                             if _pc_city_l not in KNOWN_STATES:
                                 KNOWN_STATES.add(_pc_city_l)
+                        elif _place_type == 'unknown':
+                            # Unresolved — preserve value, flag for review
+                            if not put_addr(idx, pc_city2):
+                                flag(idx, f'GEO_UNRESOLVED_NO_SPACE:{pc_city2}')
                         else:
                             df.at[idx, C('city')] = pc_city2
                             cty = pc_city2  # low confidence fallback
@@ -1787,6 +1906,32 @@ if run:
                     setcol(idx,'country',ISO_TO_COUNTRY[st_]); cou=ISO_TO_COUNTRY[st_]
                 if not cid:
                     setcol(idx,'country_id',st_); cid=st_
+                setcol(idx,'state',''); st_=''
+
+        # ── 2b. STATE is a level-2 unit → move to ADDRESS3 ─────────────
+        # e.g. 'Haidian District' has only a Level-2 keyword → goes to A3, not STATE
+        _L2_KW = re.compile(
+            r'\b(District|County|Borough|Township|Ward|Sub-city|Subcity|'
+            r'Subcounty|Sub-county|Kebele|Woreda|Arrondissement|Gun|'
+            r'Rayon|Raion|Commune|Parish|Tehsil|Taluk|Mandal|Upazila|'
+            r'Thana|Zila|Neighbourhood|Neighborhood|Quarter)\b', re.I)
+        _L1_KW = re.compile(
+            r'\b(Province|Region|Oblast|Krai|Kray|Prefecture|Governorate|'
+            r'Department|Territory|Okrug|Administrative|Zone|Republic|'
+            r'Voivodeship|Canton|Emirate|Shire|Wilayat|Division|'
+            r'Muhafazah|Area|Sector|Circuit|Cercle|Constituency)\b', re.I)
+        if st_ and _L2_KW.search(st_) and not _L1_KW.search(st_):
+            # Pure level-2 unit in STATE → move to ADDRESS3
+            _ex_a3 = str(df.at[idx,C('address3')] if C('address3') else '').strip()
+            if C('address3') and not _ex_a3:
+                record(idx,'address3','',st_)
+                setcol(idx,'address3',st_)
+                setcol(idx,'state',''); st_=''
+            elif C('address3') and _ex_a3:
+                # ADDRESS3 already has content — prepend
+                _merged = st_ + ', ' + _ex_a3
+                record(idx,'address3',_ex_a3,_merged)
+                setcol(idx,'address3',_merged)
                 setcol(idx,'state',''); st_=''
 
         # ── 3. Fix POSTAL junk ────────────────────────────────────
@@ -2299,6 +2444,8 @@ if 'cleaned_df' in st.session_state:
                 exc_all = df[df['EXCEPTION_FLAG'].str.strip() != '']
                 if not exc_all.empty:
                     exc_all.to_excel(w, sheet_name='Exception Review', index=False)
+            if GEO_LOG:
+                pd.DataFrame(GEO_LOG).to_excel(w, sheet_name='Geo Lookup Log', index=False)
         st.download_button(
             "⬇️  Download Cleaned Excel",
             data=buf.getvalue(),
