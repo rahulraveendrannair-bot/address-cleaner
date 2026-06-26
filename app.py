@@ -1849,10 +1849,10 @@ def run_osm_validation(df, col_map):
 
             if mode == 'postal':
                 # POSTAL: validate via validate_postal function
-                ok, reason = validate_postal(val, country_hint)
-                if not ok:
+                postal_result = validate_postal(val, country_hint)
+                if postal_result == 'INVALID':
                     log['status'] = 'MISMATCH'
-                    log['note']   = reason or 'Postal format invalid'
+                    log['note']   = f'Postal format invalid for country: {country_hint or "unknown"}'
                 OSM_VALIDATION_LOG.append(log)
                 continue
 
