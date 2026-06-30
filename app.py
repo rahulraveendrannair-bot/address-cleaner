@@ -269,6 +269,25 @@ def normalize_country(c):
 def get_country_code(country):
     return COUNTRY_TO_CODE.get(country.lower().strip(), '')
 
+# Module-level (not local to parse_city_field) so other functions — e.g.
+# run_osm_validation's Geoapify-driven correction — can consult the same
+# list before deciding whether a CITY value is safe to relocate. These are
+# names that are BOTH a city AND a province/state in their own country
+# (e.g. 'Manisa' is both Manisa city and Manisa Province in Turkey).
+# Geoapify may classify the value as 'state'/'province' even when it's
+# correctly sitting in CITY as the provincial capital — these names must
+# never be auto-relocated out of CITY on that basis alone.
+CITY_PROVINCE_NAMES = {
+    'istanbul','ankara','izmir','antalya','bursa','adana','konya',
+    'kocaeli','mersin','gaziantep','samsun','kayseri','manisa',
+    'eskisehir','denizli','diyarbakir','trabzon','erzurum',
+    'seoul','busan','daegu','incheon','gwangju','daejeon','ulsan',
+    'beijing','shanghai','chongqing','tianjin',
+    'tokyo','osaka','kyoto',
+    'hong kong','kowloon',
+    'ayutthaya','phra nakhon si ayutthaya',  # Thailand
+}
+
 def parse_city_field(cty):
     """Split CITY field into (city, state, addr3).
     Rules learned from 11,000+ Raw→Cleaned reference examples.
@@ -452,16 +471,9 @@ def parse_city_field(cty):
     # When paired with a small district, the city name becomes CITY
     # and the district goes to ADDRESS3.
     # e.g. 'Maltepe, Istanbul' → CITY=Istanbul, A3=Maltepe
-    _CITY_PROVINCES = {
-        'istanbul','ankara','izmir','antalya','bursa','adana','konya',
-        'kocaeli','mersin','gaziantep','samsun','kayseri',
-        'eskisehir','denizli','diyarbakir','trabzon','erzurum',
-        'seoul','busan','daegu','incheon','gwangju','daejeon','ulsan',
-        'beijing','shanghai','chongqing','tianjin',
-        'tokyo','osaka','kyoto',
-        'hong kong','kowloon',
-        'ayutthaya','phra nakhon si ayutthaya',  # Thailand
-    }
+    # Uses the module-level CITY_PROVINCE_NAMES so this list and the one
+    # consulted by run_osm_validation's correction logic never drift apart.
+    _CITY_PROVINCES = CITY_PROVINCE_NAMES
     _region_city = next(
         (parts[i] for i in sorted(region_idx)
          if parts[i].lower() in _CITY_PROVINCES),
@@ -1592,6 +1604,182 @@ def _geoapify_lookup(place_name, country_hint=''):
                 'note': f'Unexpected error: {exc}', 'source': 'geoapify_error'}
 
 
+
+def _geoapify_classify(value, country_hint=''):
+    """
+    Classify a single place-name value via Geoapify only (per spec: no
+    static-list fallback for this check). Returns one of:
+      'city'    - Geoapify result_type is 'city' or 'suburb'
+      'state'   - Geoapify result_type is 'state'
+      'other'   - any other result_type (district, country, etc.),
+                  not found, or the request failed
+    Never raises; treats any failure/ambiguity as 'other' so the value
+    safely falls through to ADDRESS3 rather than being misplaced.
+    """
+    value = (value or '').strip()
+    if not value:
+        return 'other'
+    import time as _time
+    _time.sleep(1.0)   # respect Geoapify rate limits — this now runs on every row
+    result = _geoapify_lookup(value, country_hint)
+    if not result:
+        return 'other'
+    geo_type = (result.get('type') or 'unknown').lower()
+    if geo_type in ('city', 'suburb'):
+        return 'city'
+    if geo_type == 'state':
+        return 'state'
+    return 'other'
+
+
+def classify_city_state_via_geoapify(df, col_map):
+    """
+    Mandatory pipeline step (runs every cleaning pass, no toggle) that
+    re-derives CITY and STATE using Geoapify as the sole classifier —
+    static lists (CITY_TO_COUNTRY/KNOWN_STATES) are intentionally NOT
+    consulted here, per spec.
+
+    Rules, applied per row:
+
+    CITY column:
+      - If it contains a comma, split into exactly two parts:
+          part1: checked city-first. If Geoapify says city -> CITY=part1.
+                 Else checked for state. If neither -> moved to ADDRESS3.
+          part2: checked state-first. If Geoapify says state -> STATE=part2
+                 (only if STATE is currently blank). Else checked for city.
+                 If neither -> moved to ADDRESS3.
+      - If no comma: check the single value. City -> stays in CITY.
+        Not a city -> check if it's a state (state goes to STATE if blank).
+        Neither -> moved to ADDRESS3.
+
+    STATE column: same single-value logic as the no-comma CITY case —
+    checked for state first, then city, otherwise moved to ADDRESS3.
+
+    After CITY/STATE handling: if either column is still blank, scan
+    ADDRESS1/2/3 for a city or state via Geoapify and promote the first
+    match found into the appropriate blank column.
+
+    Values moved to ADDRESS3 are appended (comma-separated) rather than
+    overwriting existing ADDRESS3 content. No value is ever invented —
+    only relocated among the columns that already existed in the row.
+    """
+    C = lambda f: col_map.get(f, '')
+    city_col  = C('city')
+    state_col = C('state')
+    a1_col    = C('address')
+    a2_col    = C('address2')
+    a3_col    = C('address3')
+
+    def _append_a3(idx_row, text):
+        if not a3_col or not text:
+            return
+        existing = str(df.at[idx_row, a3_col]).strip() if a3_col in df.columns else ''
+        if existing and existing.lower() not in ('', 'nan'):
+            df.at[idx_row, a3_col] = f"{existing}, {text}"
+        else:
+            df.at[idx_row, a3_col] = text
+
+    for idx_row in df.index:
+        row = df.loc[idx_row]
+        country_hint = str(row.get(C('country'), '') or '').strip()
+
+        # ── CITY column ──────────────────────────────────────────────
+        cty_val = str(row.get(city_col, '') or '').strip() if city_col else ''
+        if cty_val and cty_val.lower() != 'nan':
+            if ',' in cty_val:
+                parts = [p.strip() for p in cty_val.split(',', 1)]
+                part1, part2 = parts[0], parts[1] if len(parts) > 1 else ''
+
+                # part1: city-first check
+                if part1:
+                    p1_type = _geoapify_classify(part1, country_hint)
+                    if p1_type == 'city':
+                        df.at[idx_row, city_col] = part1
+                    elif p1_type == 'state':
+                        if state_col and not str(row.get(state_col, '') or '').strip():
+                            df.at[idx_row, state_col] = part1
+                        df.at[idx_row, city_col] = ''
+                    else:
+                        _append_a3(idx_row, part1)
+                        df.at[idx_row, city_col] = ''
+                else:
+                    df.at[idx_row, city_col] = ''
+
+                # part2: state-first check
+                if part2:
+                    p2_type = _geoapify_classify(part2, country_hint)
+                    _existing_state = str(df.at[idx_row, state_col] or '').strip() if state_col else ''
+                    if p2_type == 'state':
+                        if state_col and not _existing_state:
+                            df.at[idx_row, state_col] = part2
+                        elif state_col and _existing_state.lower() != part2.lower():
+                            _append_a3(idx_row, part2)
+                    elif p2_type == 'city':
+                        _existing_city = str(df.at[idx_row, city_col] or '').strip() if city_col else ''
+                        if city_col and not _existing_city:
+                            df.at[idx_row, city_col] = part2
+                        else:
+                            _append_a3(idx_row, part2)
+                    else:
+                        _append_a3(idx_row, part2)
+            else:
+                # No comma — single-value check, city-first (matches the
+                # column's own identity: this IS the city field).
+                v_type = _geoapify_classify(cty_val, country_hint)
+                if v_type == 'city':
+                    pass  # already correctly in CITY
+                elif v_type == 'state':
+                    if state_col and not str(row.get(state_col, '') or '').strip():
+                        df.at[idx_row, state_col] = cty_val
+                    df.at[idx_row, city_col] = ''
+                else:
+                    _append_a3(idx_row, cty_val)
+                    df.at[idx_row, city_col] = ''
+
+        # ── STATE column ─────────────────────────────────────────────
+        # Re-read STATE since the CITY block above may have just filled it.
+        st_val = str(df.at[idx_row, state_col] or '').strip() if state_col else ''
+        if st_val and st_val.lower() != 'nan':
+            s_type = _geoapify_classify(st_val, country_hint)
+            if s_type == 'state':
+                pass  # already correctly in STATE
+            elif s_type == 'city':
+                if city_col and not str(df.at[idx_row, city_col] or '').strip():
+                    df.at[idx_row, city_col] = st_val
+                    df.at[idx_row, state_col] = ''
+                else:
+                    _append_a3(idx_row, st_val)
+                    df.at[idx_row, state_col] = ''
+            else:
+                _append_a3(idx_row, st_val)
+                df.at[idx_row, state_col] = ''
+
+        # ── Backfill from ADDRESS1/2/3 if CITY or STATE still blank ───
+        _cty_now = str(df.at[idx_row, city_col]  or '').strip() if city_col  else ''
+        _st_now  = str(df.at[idx_row, state_col] or '').strip() if state_col else ''
+        if not _cty_now or not _st_now:
+            for addr_col in (a1_col, a2_col, a3_col):
+                if not addr_col or addr_col not in df.columns:
+                    continue
+                if _cty_now and _st_now:
+                    break
+                addr_val = str(df.at[idx_row, addr_col] or '').strip()
+                if not addr_val or addr_val.lower() == 'nan':
+                    continue
+                # Try each comma-separated piece of the address field.
+                for piece in [p.strip() for p in addr_val.split(',')]:
+                    if not piece:
+                        continue
+                    if _cty_now and _st_now:
+                        break
+                    piece_type = _geoapify_classify(piece, country_hint)
+                    if piece_type == 'city' and not _cty_now:
+                        df.at[idx_row, city_col] = piece
+                        _cty_now = piece
+                    elif piece_type == 'state' and not _st_now:
+                        df.at[idx_row, state_col] = piece
+                        _st_now = piece
+
 def geo_lookup(place_name, country_hint=''):
     """
     Classify a place name using the Geoapify Geocoding API.
@@ -1815,7 +2003,24 @@ def run_osm_validation(df, col_map):
                     log['osm_display'] = geo_result.get('note', '')[:120]
                     if geo_type in allowed_types:
                         log['status'] = 'OK'
-                    elif col_key == 'city' and geo_type in ('suburb', 'district'):
+                    elif col_key == 'city' and val.lower() in CITY_PROVINCE_NAMES:
+                        # Known city-province name overlap (e.g. 'Manisa' is
+                        # both Manisa city and Manisa Province in Turkey;
+                        # same pattern as Istanbul, Ankara, Antalya, Tokyo).
+                        # Geoapify may classify this as 'state'/'province'
+                        # even though the value is correctly sitting in
+                        # CITY — never relocate these regardless of what
+                        # Geoapify's result_type says.
+                        log['status'] = 'OK'
+                        log['note']   = (f"'{val}' is a known city-province name "
+                                         f"(Geoapify said '{geo_type}') — not relocated")
+                    elif col_key == 'city':
+                        # Anything Geoapify classifies for a CITY value that
+                        # isn't 'city' itself (suburb, district, county,
+                        # street, etc.) is relocated out of CITY — see the
+                        # correction block below. This deliberately covers
+                        # every non-city type, not just suburb/district, so
+                        # ANY classification besides 'city' triggers a move.
                         log['status'] = 'CORRECTED'
                         log['note']   = f"Geoapify identifies '{val}' as a {geo_type}"
                     else:
@@ -1826,42 +2031,68 @@ def run_osm_validation(df, col_map):
                 log['_raw_geo_result'] = geo_result   # cached for dedup reuse below
                 _seen[dedup_key] = log   # cache only OK/MISMATCH/NOT_FOUND/CORRECTED, never ERROR
 
-            # ── Auto-correction: suburb/village/district in CITY ─────────
+            # ── Auto-correction: relocate CITY values that are not a city ──
             # Only field-value change this function makes. Triggered when
-            # Geoapify confirms the CITY value is actually a suburb or
-            # district, not a standalone city. Moves the suburb/district
-            # name to ADDRESS3 (or ADDRESS2 if A3 is occupied/unavailable).
+            # Geoapify classifies the CITY value as something other than
+            # 'city' (or 'state' is mismatched, when checking the STATE
+            # column). The value is moved to ADDRESS1 if ADDRESS1 is empty;
+            # otherwise it's appended to ADDRESS2 if empty, otherwise
+            # ADDRESS3 if empty; if all three already have content, the
+            # value is concatenated onto ADDRESS3 with a ", " delimiter
+            # rather than being dropped.
             #
-            # IMPORTANT: CITY is left BLANK after the move, never filled
-            # with Geoapify's suggested parent city. The agent must not
-            # introduce a value (e.g. 'George Town') that wasn't present
-            # anywhere in the original source address — that would be
+            # IMPORTANT: CITY is left BLANK after the move. The agent never
+            # invents a replacement city name (e.g. a Geoapify-suggested
+            # parent city) — that information was not present in the
+            # original source address, and inserting it would be
             # fabricating data, not cleaning it.
             if col_key == 'city' and log['status'] == 'CORRECTED' and geo_result:
-                _corrected_type = geo_result.get('type', 'suburb')
-                a3_col = C('address3')
+                _corrected_type = geo_result.get('type', 'unknown')
+                a1_col = C('address')
                 a2_col = C('address2')
+                a3_col = C('address3')
+
+                def _is_blank(colname):
+                    if not colname or colname not in df.columns:
+                        return False
+                    existing = str(df.at[idx_row, colname]).strip()
+                    return not existing or existing.lower() in ('', 'nan')
+
                 moved_to = None
-                if a3_col:
-                    existing_a3 = str(df.at[idx_row, a3_col]).strip() if a3_col in df.columns else ''
-                    if not existing_a3 or existing_a3.lower() in ('', 'nan'):
-                        df.at[idx_row, a3_col] = val
-                        moved_to = 'ADDRESS3'
-                if not moved_to and a2_col:
-                    existing_a2 = str(df.at[idx_row, a2_col]).strip() if a2_col in df.columns else ''
-                    if not existing_a2 or existing_a2.lower() in ('', 'nan'):
-                        df.at[idx_row, a2_col] = val
-                        moved_to = 'ADDRESS2'
+                if a1_col and _is_blank(a1_col):
+                    df.at[idx_row, a1_col] = val
+                    moved_to = 'ADDRESS1'
+                elif a2_col and _is_blank(a2_col):
+                    df.at[idx_row, a2_col] = val
+                    moved_to = 'ADDRESS2'
+                elif a3_col and _is_blank(a3_col):
+                    df.at[idx_row, a3_col] = val
+                    moved_to = 'ADDRESS3'
+                elif a3_col:
+                    # All three are occupied — concatenate onto ADDRESS3
+                    # with a ', ' delimiter rather than dropping the value.
+                    existing_a3 = str(df.at[idx_row, a3_col]).strip()
+                    df.at[idx_row, a3_col] = f"{existing_a3}, {val}" if existing_a3 else val
+                    moved_to = 'ADDRESS3 (appended)'
+                elif a2_col:
+                    existing_a2 = str(df.at[idx_row, a2_col]).strip()
+                    df.at[idx_row, a2_col] = f"{existing_a2}, {val}" if existing_a2 else val
+                    moved_to = 'ADDRESS2 (appended)'
+                elif a1_col:
+                    existing_a1 = str(df.at[idx_row, a1_col]).strip()
+                    df.at[idx_row, a1_col] = f"{existing_a1}, {val}" if existing_a1 else val
+                    moved_to = 'ADDRESS1 (appended)'
+
                 if moved_to:
                     df.at[idx_row, col] = ''   # leave CITY blank — do not invent a value
                     log['note'] = (f"Moved '{val}' ({_corrected_type}) to {moved_to}; "
                                    f"CITY left blank (no city name was present in source data)")
                 else:
-                    # Both ADDRESS2/3 are occupied — don't overwrite
-                    # existing data. Fall back to a flag for manual review.
+                    # No address columns are configured at all — nothing
+                    # safe to do. Fall back to a flag for manual review.
                     log['status'] = 'MISMATCH'
-                    log['note']   = (f"'{val}' is a {_corrected_type}, but "
-                                     f"ADDRESS2/3 are both occupied — not auto-corrected")
+                    log['note']   = (f"'{val}' is a {_corrected_type}, but no ADDRESS1/2/3 "
+                                     f"column is configured — not auto-corrected")
 
             OSM_VALIDATION_LOG.append(log)
 
@@ -2498,9 +2729,12 @@ if run:
                                 record(idx,'address',_ex_a1,_merged_a1)
                                 setcol(idx,'address',_merged_a1)
 
-        # ── 9. Parse CITY field ───────────────────────────────────
+        # ── 9. Extract embedded postal code from CITY field ────────
+        # (City/State classification itself now happens in a dedicated
+        # Geoapify-driven pass after this loop — see
+        # classify_city_state_via_geoapify — which replaces the old
+        # static-list-based parse_city_field logic and Step 9b.)
         if cty:
-            # Remove embedded postal
             city_parts = [p.strip() for p in cty.split(',')]
             clean_city = []
             for part in city_parts:
@@ -2510,70 +2744,6 @@ if run:
                     clean_city.append(part)
             if len(clean_city) != len(city_parts):
                 cty = ', '.join(clean_city); setcol(idx,'city',cty)
-
-            # Pre-expand 2-letter US/CA state codes in the city string
-            # so parse_city_field can recognise them as state values
-            _cty_parts = [p.strip() for p in cty.split(',')]
-            if len(_cty_parts) >= 2:
-                _last_part = _cty_parts[-1].strip()
-                if _last_part in US_STATES:
-                    _expanded = US_STATE_EXPAND.get(_last_part, _last_part)
-                    # Don't expand if result equals the city (e.g. 'New York, New York')
-                    if _expanded.lower() != _cty_parts[0].lower():
-                        _cty_parts[-1] = _expanded
-                        cty = ', '.join(_cty_parts)
-                        setcol(idx,'city',cty)
-                elif _last_part in CA_PROVS:
-                    _cty_parts[-1] = CA_PROV_EXPAND.get(_last_part, _last_part)
-                    cty = ', '.join(_cty_parts)
-                    setcol(idx,'city',cty)
-            city_v, state_v, addr3_v = parse_city_field(cty)
-            if city_v != cty or state_v or addr3_v:
-                record(idx,'city',cty,city_v)
-                # Apply canonical city name if available
-                city_v = CITY_NORMALIZE.get(city_v.lower(), city_v)
-                setcol(idx,'city',city_v); cty=city_v
-                if state_v and not st_:  # only write STATE if currently blank
-                    # Expand US/CA abbreviations extracted from CITY field
-                    if state_v in US_STATES:
-                        state_v = US_STATE_EXPAND.get(state_v, state_v)
-                    elif state_v in CA_PROVS:
-                        state_v = CA_PROV_EXPAND.get(state_v, state_v)
-                    if extraction_confidence(state_v,'state') in ('HIGH','MEDIUM'):
-                        setcol(idx,'state',state_v); st_=state_v
-                    else:
-                        df.at[idx,'EXCEPTION_FLAG'] = 'LOW_CONF_STATE_SKIPPED'
-                if addr3_v and C('address3'):
-                    ex = str(df.at[idx,C('address3')]).strip()
-                    setcol(idx,'address3',(ex+', '+addr3_v).strip(', ') if ex else addr3_v)
-            # Flag CITY values not found in the static reference list as
-            # uncertain — without this, places the parser confidently but
-            # unverifiably extracted (e.g. 'Tanjong Tokong') would never be
-            # checked by OSM validation, since that pass only looks at rows
-            # already marked uncertain.
-            if cty and cty.lower() not in CITY_TO_COUNTRY:
-                _existing_flag = str(df.at[idx,'EXCEPTION_FLAG']).strip() if 'EXCEPTION_FLAG' in df.columns else ''
-                _unverified_flag = 'UNVERIFIED_CITY'
-                if _existing_flag and _existing_flag not in ('', 'nan'):
-                    if _unverified_flag not in _existing_flag:
-                        df.at[idx,'EXCEPTION_FLAG'] = _existing_flag + ' | ' + _unverified_flag
-                else:
-                    df.at[idx,'EXCEPTION_FLAG'] = _unverified_flag
-
-        # ── 9b. Move STATE → CITY if CITY is now blank and STATE is a city name ─
-        _cty_9b = str(df.at[idx,C('city')]  if C('city')  else '').strip()
-        _st_9b  = str(df.at[idx,C('state')] if C('state') else '').strip()
-        if _st_9b and not _cty_9b and C('city'):
-            _CITY_SUFFIX_9B = re.compile(r'\bCity\s*$', re.I)
-            _ends_city_9b   = bool(_CITY_SUFFIX_9B.search(_st_9b))
-            _in_ctc_9b      = _st_9b.lower() in CITY_TO_COUNTRY
-            _in_kst_9b      = _st_9b.lower() in KNOWN_STATES
-            _has_stkw_9b    = bool(STATE_KW.search(_st_9b))
-            if (_ends_city_9b and not _has_stkw_9b) or \
-               (_in_ctc_9b and not _in_kst_9b and not _has_stkw_9b):
-                record(idx,'city','',_st_9b)
-                setcol(idx,'city',_st_9b); cty=_st_9b
-                setcol(idx,'state','');    st_=''
 
         # ── 10. Extract territory from ADDRESS1 ───────────────────
         if a1 and not NOTE_RE.match(a1):
@@ -2880,6 +3050,14 @@ if run:
             df['EXCEPTION_FLAG'] = ''
         if str(df.at[idx,'EXCEPTION_FLAG']) in ('', 'nan', 'NaN'):
             df.at[idx,'EXCEPTION_FLAG'] = ''
+
+    # ── City/State classification via Geoapify (mandatory, every run) ──────────
+    # Replaces the old static-list-driven parse_city_field/Step 9b logic.
+    # Geoapify is the sole authority here per spec — no static-list
+    # fallback. Runs once over the whole dataframe after the main
+    # per-row pipeline above has finished.
+    prog.progress(0.89, text="Classifying City/State via Geoapify…")
+    classify_city_state_via_geoapify(df, col_map)
 
     # ── Address field compaction ──────────────────────────────────────────────
     # If ADDRESS1 is blank but ADDRESS2/3 has content, shift fields up.
