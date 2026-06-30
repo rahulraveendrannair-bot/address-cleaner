@@ -1386,10 +1386,17 @@ with st.sidebar:
     o_infer   = st.checkbox("Infer missing countries", True)
 
     geo_verify = st.toggle(
-        "🌐 Validate City/State via OpenStreetMap",
+        "🌐 Validate City/State via Geoapify",
         value=False,
-        help="After cleaning, validates City/State only on rows already flagged as uncertain by the cleaning pipeline (e.g. low-confidence extractions). Flags OSM mismatches in EXCEPTION_FLAG and logs results in the OSM Validation sheet. Skipped on clean rows to stay within OpenStreetMap's usage policy."
+        help="After cleaning, validates City/State only on rows already flagged as uncertain by the cleaning pipeline (e.g. low-confidence extractions, unrecognized city names). Flags mismatches in EXCEPTION_FLAG and logs results in the OSM Validation sheet. Requires a free Geoapify API key (set as GEOAPIFY_API_KEY in Streamlit secrets) — get one at myprojects.geoapify.com, free tier includes 3000 requests/day."
     )
+    if geo_verify and not _get_geoapify_api_key():
+        st.warning(
+            "⚠️ GEOAPIFY_API_KEY is not configured. Add it under Settings → "
+            "Secrets as `GEOAPIFY_API_KEY = \"your-key-here\"`, or set it as an "
+            "environment variable. Validation will run but every lookup will "
+            "report ERROR until a key is set."
+        )
 
     run = st.button(
         "▶  Clean Addresses", type="primary",
@@ -1407,299 +1414,223 @@ if not run and 'cleaned_df' not in st.session_state:
     st.caption(f"Showing 30 of {len(df_raw):,} rows")
     st.stop()
 
-import requests, json, re, time
+import requests, json, re, time, os
 
-# ── Geo-lookup: OpenStreetMap (Nominatim) primary, Falling Rain fallback ─────
+# ── Geo-lookup: Geoapify Geocoding API ───────────────────────────────────────
 # Rules:
-#   1. OSM is always tried first; result validated before fallback is triggered
-#   2. Falling Rain is used ONLY when OSM returns nothing or fails validation
-#   3. Data from the two sources is NEVER mixed within a single record
-#   4. Every fallback is logged with a reason (GEO_LOG)
+#   1. Static lookup lists (CITY_TO_COUNTRY, KNOWN_STATES) are checked first
+#   2. Geoapify is used only when the static lists don't recognize the place
+#   3. Geoapify is used ONLY to determine place type — it never replaces or
+#      augments the source value written to any output column
+#   4. Every lookup is logged with its outcome (GEO_LOG)
 #   5. Unresolved cases are explicitly flagged as GEO_UNRESOLVED
 #
 # Source field values:
-#   'osm'          – OpenStreetMap / Nominatim
-#   'fallingrain'  – Falling Rain gazetteer
+#   'geoapify'     – Geoapify Geocoding API
 #   'static'       – agent's own static lookup lists
 #   'unresolved'   – place could not be classified
 
 _geo_cache = {}   # (place_lower, country_lower) → result dict
 GEO_LOG    = []   # audit log of every lookup + fallback reason
 
-_OSM_TYPE_MAP = {
-    'city':         'city',   'town':          'city',
-    'village':      'city',   'hamlet':        'city',
-    'municipality': 'city',   'suburb':        'city',
-    'quarter':      'city',   'locality':      'city',
-    'state':        'state',  'province':      'state',
-    'region':       'state',  'department':    'state',
-    'prefecture':   'state',  'autonomous_region': 'state',
-    'county':       'district', 'district':    'district',
-    'borough':      'district', 'neighbourhood':'district',
-    'country':      'country',
+# Geoapify's documented result_type values (api docs: 'unknown', 'amenity',
+# 'building', 'street', 'suburb', 'district', 'postcode', 'city', 'county',
+# 'state', 'country') mapped to our internal type vocabulary.
+_GEOAPIFY_TYPE_MAP = {
+    'city':      'city',
+    'suburb':    'city',      # suburbs/villages classify as city-level for our purposes
+    'district':  'district',
+    'county':    'district',
+    'state':     'state',
+    'country':   'country',
+    'postcode':  'unknown',   # not a place name, doesn't map to city/state/district
+    'street':    'unknown',
+    'building':  'unknown',
+    'amenity':   'unknown',
+    'unknown':   'unknown',
 }
 
-# Official Nominatim address_rank → place type, per the rank table shown on
-# https://nominatim.openstreetmap.org/ui/search.html (Details → Address Rank).
-# Used as the authoritative fallback whenever 'addresstype' is missing,
-# unmapped, or ambiguous (e.g. 'administrative' boundaries with no clear tag).
-#   4        = country
-#   5-9      = state / province / region
-#  10-12     = county / district (state subdivision)
-#  13-16     = city / municipality / town
-#  17-21     = village / suburb / hamlet / neighbourhood
-#  22-30     = street / building / POI (not a place classification)
-def _rank_to_type(rank):
-    try:
-        r = int(rank)
-    except (TypeError, ValueError):
-        return 'unknown'
-    if r <= 4:
-        return 'country'
-    if 5 <= r <= 9:
-        return 'state'
-    if 10 <= r <= 12:
-        return 'district'
-    if 13 <= r <= 16:
-        return 'city'
-    if 17 <= r <= 21:
-        return 'city'   # suburb/village/hamlet — still address-level 'city' bucket
-    return 'unknown'    # 22-30: street/building/POI — not a place classification
 
-
-def _validate_osm_result(result, place_name):
+def _get_geoapify_api_key():
     """
-    Validate an OSM result before accepting it.
+    Read the Geoapify API key from Streamlit secrets (preferred) or an
+    environment variable. Returns '' if not configured anywhere, so the
+    caller can skip live lookups gracefully instead of crashing.
+    """
+    try:
+        if hasattr(st, 'secrets') and 'GEOAPIFY_API_KEY' in st.secrets:
+            return str(st.secrets['GEOAPIFY_API_KEY']).strip()
+    except Exception:
+        pass
+    return os.environ.get('GEOAPIFY_API_KEY', '').strip()
+
+
+def _validate_geoapify_result(result, place_name):
+    """
+    Validate a Geoapify result before accepting it.
     Returns (is_valid, reason_if_invalid).
     """
     if not result:
         return False, "empty result"
     if result.get('type') == 'unknown':
-        return False, "OSM returned unknown type"
+        return False, "Geoapify returned unknown/non-place type"
     display = result.get('note', '')
     if display and place_name.lower() not in display.lower():
-        # Name mismatch — OSM returned something unrelated
         return False, f"name mismatch: searched '{place_name}', got '{display[:60]}'"
-    if not result.get('_osm_country'):
-        return False, "no country in OSM result"
+    if not result.get('_geo_country'):
+        return False, "no country in Geoapify result"
     return True, ""
 
-def _nominatim_lookup(place_name, country_hint=''):
-    """Query Nominatim (OpenStreetMap). Returns structured result or None."""
+
+def _geoapify_lookup(place_name, country_hint=''):
+    """
+    Query the Geoapify Geocoding API. Returns a structured result dict or
+    None if no results were found at all. On error/rate-limit, returns a
+    dict tagged with source 'geoapify_error' / 'geoapify_rate_limited' so
+    callers can distinguish a failed request from a genuine not-found.
+    """
     import urllib.parse
+    api_key = _get_geoapify_api_key()
+    if not api_key:
+        return {'type': 'unknown', 'confidence': 'low',
+                'note': 'GEOAPIFY_API_KEY not configured',
+                'source': 'geoapify_error'}
+
     # Don't append country_hint if it duplicates the search term itself
     # (e.g. validating COUNTRY='Turkey' would otherwise search 'Turkey Turkey')
-    # or if it's already contained in place_name (e.g. 'Moscow Oblast, Russia').
+    # or if it's already contained in place_name.
     _hint = country_hint.strip()
     if _hint and (_hint.lower() == place_name.strip().lower()
                   or _hint.lower() in place_name.lower()):
         _hint = ''
+    query_text = (place_name + (' ' + _hint if _hint else '')).strip()
+
     params = {
-        'q':              (place_name + (' ' + _hint if _hint else '')).strip(),
-        'format':         'json',
-        'addressdetails': '1',
-        'limit':          '3',
-        'accept-language':'en',
+        'text':   query_text,
+        'apiKey': api_key,
+        'limit':  '3',
+        'format': 'json',
+        'lang':   'en',
     }
-    url = 'https://nominatim.openstreetmap.org/search?' + urllib.parse.urlencode(params)
+    url = 'https://api.geoapify.com/v1/geocode/search?' + urllib.parse.urlencode(params)
     try:
-        r = requests.get(url, timeout=10,
-                         headers={'User-Agent': 'address-cleaner-app/1.0'})
-        if r.status_code == 429 or r.status_code == 403:
-            # Rate-limited or blocked — NOT the same as 'place not found'.
-            # Surface this distinctly so it isn't silently treated as NOT_FOUND.
+        r = requests.get(url, timeout=10)
+        if r.status_code == 429:
             return {'type': 'unknown', 'confidence': 'low',
-                    'note': f'HTTP {r.status_code}: {r.text[:120]}',
-                    'source': 'osm_rate_limited'}
+                    'note': f'HTTP 429 rate limited: {r.text[:120]}',
+                    'source': 'geoapify_rate_limited'}
+        if r.status_code in (401, 403):
+            return {'type': 'unknown', 'confidence': 'low',
+                    'note': f'HTTP {r.status_code} auth error: {r.text[:120]}',
+                    'source': 'geoapify_error'}
         r.raise_for_status()
-        results = r.json()
+        data = r.json()
+        results = data.get('results', [])
         if not results:
             return None
-        # Pick best match: prefer exact name match, then first result
+
+        # Pick best match: prefer exact name match against the returned
+        # 'name' or 'city' field, then fall back to the top-ranked result.
         best = None
         for res in results[:3]:
-            name_in_display = place_name.lower() in res.get('display_name', '').lower()
-            if name_in_display:
+            candidate_name = (res.get('name') or res.get('city') or
+                              res.get('formatted') or '')
+            if place_name.lower() in candidate_name.lower():
                 best = res
                 break
         if not best:
             best = results[0]
 
-        addr       = best.get('address', {})
-        osm_type   = (best.get('addresstype') or best.get('type') or '').lower()
-        place_type = _OSM_TYPE_MAP.get(osm_type, 'unknown')
-        # Fallback type detection from class
-        if place_type == 'unknown' and best.get('class') == 'place':
-            place_type = _OSM_TYPE_MAP.get(best.get('type', '').lower(), 'unknown')
-        # Final fallback: use address_rank/place_rank (same value the search.html
-        # UI shows under Details → 'Address Rank'). Catches boundary:administrative
-        # results and anything else 'addresstype' didn't resolve to a known type.
-        if place_type == 'unknown':
-            rank = best.get('address_rank', best.get('place_rank'))
-            place_type = _rank_to_type(rank)
+        geoapify_type = (best.get('result_type') or 'unknown').lower()
+        place_type    = _GEOAPIFY_TYPE_MAP.get(geoapify_type, 'unknown')
 
-        osm_state   = (addr.get('state') or addr.get('region') or
-                       addr.get('province') or addr.get('department') or
-                       addr.get('county') or '')
-        osm_country = addr.get('country', '')
+        rank = best.get('rank', {}) or {}
+        confidence_score = rank.get('confidence', 0)
+        confidence = 'high' if confidence_score >= 0.8 else (
+                     'medium' if confidence_score >= 0.4 else 'low')
+
+        geo_state   = best.get('state', '')
+        geo_country = best.get('country', '')
 
         return {
             'type':        place_type,
-            'confidence':  'high' if place_type != 'unknown' else 'medium',
-            'source':      'osm',
-            'osm_id':      str(best.get('osm_id', '')),
+            'confidence':  confidence,
+            'source':      'geoapify',
+            'place_id':    str(best.get('place_id', '')),
             # Metadata only — never write these to output fields:
-            '_osm_state':   osm_state,
-            '_osm_country': osm_country,
-            'note':         best.get('display_name', '')[:150],
+            '_geo_state':   geo_state,
+            '_geo_country': geo_country,
+            'note':         (best.get('formatted') or '')[:150],
         }
     except requests.exceptions.RequestException as exc:
-        # Network/connection failure — distinct from 'place not found'
         return {'type': 'unknown', 'confidence': 'low',
-                'note': f'Network error: {exc}', 'source': 'osm_error'}
+                'note': f'Network error: {exc}', 'source': 'geoapify_error'}
     except Exception as exc:
         return {'type': 'unknown', 'confidence': 'low',
-                'note': f'Unexpected error: {exc}', 'source': 'osm_error'}
-
-
-def parse_fr_snippet(snippet):
-    """Parse a Falling Rain description: 'Nikki is a city in Borgou Dept in Benin.'"""
-    import re
-    result = {'type': 'unknown', 'state': '', 'country': ''}
-    if not snippet:
-        return result
-    tl = snippet.lower()
-    if re.search(r'\b(is a city|is a town|is a village|is a populated place|is a municipality)\b', tl):
-        result['type'] = 'city'
-    elif re.search(r'\b(is an? autonomous prefecture|is a prefecture)\b', tl):
-        result['type'] = 'state'
-    elif re.search(r'\b(is a state|is a province|is a region|is a department|is an? autonomous region)\b', tl):
-        result['type'] = 'state'
-    elif re.search(r'\b(is a district|is a county|is a borough|is a ward|is a sub-district)\b', tl):
-        result['type'] = 'district'
-    elif re.search(r'\b(is a country|is a nation)\b', tl):
-        result['type'] = 'country'
-    in_parts = re.findall(r'\bin ([A-Z][a-zA-Z\s\-]+?)(?= in |\.|,|$)', snippet)
-    if len(in_parts) >= 2:
-        result['state']   = in_parts[-2].strip()
-        result['country'] = in_parts[-1].strip()
-    elif len(in_parts) == 1:
-        result['country'] = in_parts[0].strip()
-    return result
-
-
-def _fallingrain_lookup(place_name, country_hint=''):
-    """Search fallingrain.com/world. Returns structured result or None."""
-    import urllib.parse, re
-    query = urllib.parse.quote(
-        (place_name + (' ' + country_hint if country_hint else '')).strip()
-    )
-    url = f'https://www.fallingrain.com/world/search.cgi?searchterm={query}'
-    try:
-        r = requests.get(url, timeout=10, headers={
-            'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer':         'https://www.fallingrain.com/world/',
-        })
-        r.raise_for_status()
-        html = r.text
-        # Extract first result: href + name + description
-        m = re.search(
-            r'href="(/world/([A-Z]{2})/\d+/[^"]+\.html)">([^<]+)</a>[^<]*<br[^>]*>([^<]*)',
-            html
-        )
-        if not m:
-            return None
-        path, cc, name, desc = m.group(1), m.group(2), m.group(3).strip(), m.group(4).strip()
-        # Validate: returned name should match what we searched
-        if place_name.lower() not in name.lower():
-            return {'type': 'unknown', 'state': '', 'country': '',
-                    'confidence': 'low',
-                    'note': f'name mismatch: searched {place_name!r}, got {name!r}',
-                    'source': 'fallingrain_mismatch'}
-        parsed = parse_fr_snippet(f"{name} {desc}")
-        # Rename state/country to metadata — never write to output fields
-        parsed['_osm_state']   = parsed.pop('state', '')
-        parsed['_osm_country'] = parsed.pop('country', '')
-        parsed['confidence']   = 'high' if parsed['type'] != 'unknown' else 'medium'
-        parsed['source']       = 'fallingrain'
-        parsed['note']         = f"{name} {desc}"[:150]
-        parsed['fr_path']      = path
-        return parsed
-    except Exception as exc:
-        return {'type': 'unknown', 'state': '', 'country': '',
-                'confidence': 'low', 'note': str(exc), 'source': 'fallingrain_error'}
+                'note': f'Unexpected error: {exc}', 'source': 'geoapify_error'}
 
 
 def geo_lookup(place_name, country_hint=''):
     """
-    Classify a place name.
-
-    Priority:
-      1. OpenStreetMap / Nominatim  — always tried first
-      2. Falling Rain               — used ONLY if OSM fails validation
+    Classify a place name using the Geoapify Geocoding API.
 
     Guarantees:
-      - OSM result is validated before fallback is triggered
-      - Data from OSM and Falling Rain is NEVER mixed in one record
-      - Every fallback is logged to GEO_LOG with the reason
+      - Geoapify result is validated before being accepted
+      - Every lookup is logged to GEO_LOG with the outcome
       - Unresolved cases carry source='unresolved'
+      - Results are cached so the same place is never looked up twice
+        in a single run
     """
     cache_key = (place_name.lower().strip(), country_hint.lower().strip())
     if cache_key in _geo_cache:
         return _geo_cache[cache_key]
 
     log_entry = {
-        'place':        place_name,
-        'country_hint': country_hint,
-        'osm_tried':    False,
-        'osm_valid':    False,
-        'fr_tried':     False,
-        'fr_valid':     False,
-        'final_source': 'unresolved',
-        'fallback_reason': '',
+        'place':            place_name,
+        'country_hint':     country_hint,
+        'geoapify_tried':   True,
+        'geoapify_valid':   False,
+        'final_source':     'unresolved',
+        'fallback_reason':  '',
     }
 
     result = None
-
-    # ── Step 1: OpenStreetMap (Nominatim) ────────────────────────────────────
-    log_entry['osm_tried'] = True
-    osm_raw = _nominatim_lookup(place_name, country_hint)
-    is_valid, invalid_reason = _validate_osm_result(osm_raw, place_name)
+    geo_raw = _geoapify_lookup(place_name, country_hint)
+    is_valid, invalid_reason = _validate_geoapify_result(geo_raw, place_name)
 
     if is_valid:
-        result = osm_raw
-        log_entry['osm_valid']    = True
-        log_entry['final_source'] = 'osm'
+        result = geo_raw
+        log_entry['geoapify_valid'] = True
+        log_entry['final_source']   = 'geoapify'
     else:
-        log_entry['fallback_reason'] = f"OSM invalid: {invalid_reason}"
+        log_entry['fallback_reason'] = f"Geoapify invalid: {invalid_reason}"
 
-    # ── Step 2: Falling Rain (fallback only if OSM failed validation) ────────
     if not result or result.get('type') == 'unknown':
-        log_entry['fr_tried'] = True
-        fr_raw = _fallingrain_lookup(place_name, country_hint)
-        if fr_raw and fr_raw.get('type') != 'unknown' and 'mismatch' not in fr_raw.get('source', ''):
-            result = fr_raw   # complete Falling Rain record — no OSM data mixed in
-            log_entry['fr_valid']     = True
-            log_entry['final_source'] = 'fallingrain'
-        else:
-            fr_reason = (fr_raw or {}).get('note', 'no result')
-            log_entry['fallback_reason'] += f" | FR invalid: {fr_reason}"
+        # Distinguish a genuine not-found from a request failure. A failed
+        # request must NOT be cached, so the next occurrence of the same
+        # place retries fresh instead of being permanently marked wrong.
+        if geo_raw and geo_raw.get('source') in ('geoapify_error', 'geoapify_rate_limited'):
+            result = {
+                'type':        'unknown',
+                'confidence':  'low',
+                'note':        geo_raw.get('note', 'request failed'),
+                'source':      geo_raw.get('source'),
+            }
+            log_entry['final_source'] = result['source']
+            result['_log'] = log_entry
+            GEO_LOG.append(log_entry)
+            return result   # not cached
 
-    # ── Unresolved ────────────────────────────────────────────────────────────
-    if not result or result.get('type') == 'unknown':
         result = {
             'type':        'unresolved',
             'confidence':  'low',
-            'note':        log_entry['fallback_reason'] or 'not found in OSM or Falling Rain',
+            'note':        log_entry['fallback_reason'] or 'not found by Geoapify',
             'source':      'unresolved',
         }
         log_entry['final_source'] = 'unresolved'
 
-    result['_log'] = log_entry   # attach audit info to result
+    result['_log'] = log_entry
     GEO_LOG.append(log_entry)
-
     _geo_cache[cache_key] = result
     return result
 
@@ -1708,9 +1639,9 @@ def classify_with_geo(place_name, country_hint='',
                       CITY_TO_COUNTRY=None, KNOWN_STATES=None, STATE_KW=None):
     """
     Classify a place name as city/state/district/country/unknown.
-    Uses static lists first, then OSM/Falling Rain as fallback.
-    OSM is used ONLY to determine type — it NEVER replaces or augments
-    source values. Returns: (type_str, confidence_str, source_str)
+    Uses static lists first, then Geoapify as fallback.
+    Geoapify is used ONLY to determine type — it NEVER replaces or
+    augments source values. Returns: (type_str, confidence_str, source_str)
     """
     p  = place_name.strip()
     pl = p.lower()
@@ -1727,12 +1658,14 @@ def classify_with_geo(place_name, country_hint='',
     confidence = result.get('confidence', 'low')
     source     = result.get('source', 'unresolved')
 
-    if geo_type in ('city', 'town', 'municipality', 'village', 'hamlet'):
-        return 'city',    confidence, source
-    if geo_type in ('state', 'province', 'region', 'prefecture'):
-        return 'state',   confidence, source
-    if geo_type in ('district', 'county', 'borough'):
+    if geo_type == 'city':
+        return 'city', confidence, source
+    if geo_type == 'state':
+        return 'state', confidence, source
+    if geo_type == 'district':
         return 'district', confidence, source
+    if geo_type == 'country':
+        return 'country', confidence, source
     if geo_type == 'unresolved':
         return 'unknown', 'low', 'unresolved'
 
@@ -1740,97 +1673,16 @@ def classify_with_geo(place_name, country_hint='',
 
 
 
-# ── OSM Post-Clean Validation ─────────────────────────────────────────────────
-# After the pipeline cleans data, this pass validates each City and State value
-# against OpenStreetMap Nominatim. It never changes any field values — it only
-# adds flags to EXCEPTION_FLAG and logs results to OSM_VALIDATION_LOG for review.
-
-OSM_VALIDATION_LOG = []   # one entry per validated field
-
-_OSM_EXPECTED_TYPES = {
-    # field → set of OSM addresstypes that are acceptable for that field
-    'city':  {'city','town','village','municipality','suburb','quarter',
-              'hamlet','locality','administrative'},
-    'state': {'state','province','region','department','prefecture',
-              'county','autonomous_region','administrative','territory'},
-}
-
-def _osm_validate_place(place_name, field, country_hint=''):
-    """
-    Query Nominatim for place_name and check if OSM's addresstype
-    is consistent with the expected field (city or state).
-    Returns a dict with: place, field, osm_type, expected_types,
-                         status ('OK'|'MISMATCH'|'NOT_FOUND'|'ERROR'),
-                         note, country_hint
-    """
-    import urllib.parse
-
-    log = {
-        'place':         place_name,
-        'field':         field,
-        'country_hint':  country_hint,
-        'osm_type':      '',
-        'osm_display':   '',
-        'expected_types': '/'.join(sorted(_OSM_EXPECTED_TYPES.get(field, set()))),
-        'status':        'NOT_FOUND',
-        'note':          '',
-    }
-
-    # Use cached geo_lookup result if available
-    cache_key = (place_name.lower().strip(), country_hint.lower().strip())
-    cached = _geo_cache.get(cache_key)
-    if cached and cached.get('source') not in ('unresolved', 'osm_error', None):
-        osm_type = cached.get('type', 'unknown').lower()
-        log['osm_type']    = osm_type
-        log['osm_display'] = cached.get('note', '')[:120]
-        expected = _OSM_EXPECTED_TYPES.get(field, set())
-        if osm_type in ('unknown', 'unresolved'):
-            log['status'] = 'NOT_FOUND'
-            log['note']   = 'Not found in OSM or Falling Rain'
-        elif osm_type in expected:
-            log['status'] = 'OK'
-        else:
-            log['status'] = 'MISMATCH'
-            log['note']   = f"OSM says '{osm_type}', but value is in {field.upper()} column"
-        return log
-
-    # Fresh Nominatim lookup
-    result = _nominatim_lookup(place_name, country_hint)
-    if not result or result.get('type') in ('unknown', None):
-        # Try Falling Rain fallback
-        result = _fallingrain_lookup(place_name, country_hint)
-
-    if not result or result.get('type') in ('unknown', None):
-        log['status'] = 'NOT_FOUND'
-        log['note']   = 'Not found in OSM or Falling Rain'
-        return log
-
-    osm_type = result.get('type', '').lower()
-    log['osm_type']    = osm_type
-    log['osm_display'] = result.get('note', '')[:120]
-
-    expected = _OSM_EXPECTED_TYPES.get(field, set())
-    if osm_type in expected:
-        log['status'] = 'OK'
-    else:
-        log['status'] = 'MISMATCH'
-        log['note']   = f"OSM says '{osm_type}', but value is in {field.upper()} column"
-
-    # Cache the result for future use
-    _geo_cache[cache_key] = result
-    return log
-
-
 def run_osm_validation(df, col_map):
     """
     Validate CITY and STATE only, and only on rows the deterministic pipeline
     already flagged in EXCEPTION_FLAG (e.g. CITY_WAS_STATE, LOW_CONF_STATE_SKIPPED,
-    UNVALIDATED_CITY_IN_ADDR, etc.) — never the whole file.
+    UNVALIDATED_CITY_IN_ADDR, UNVERIFIED_CITY, etc.) — never the whole file.
 
-    This keeps OSM usage to genuinely uncertain cases instead of a systematic
-    bulk query over every row/column, per Nominatim's usage policy:
-    https://operations.osmfoundation.org/policies/nominatim/
-    ("No heavy uses"; "Systematic queries... are forbidden").
+    Uses the Geoapify Geocoding API (free tier: 3000 requests/day, no card
+    required) rather than scraping or hammering a free public service —
+    this keeps usage well within reasonable limits and gives a real,
+    documented result_type field instead of parsing OSM admin tags.
 
     Never modifies field values — only writes flags to EXCEPTION_FLAG and
     appends to OSM_VALIDATION_LOG for the download sheet.
@@ -1839,16 +1691,19 @@ def run_osm_validation(df, col_map):
     OSM_VALIDATION_LOG.clear()
     C = lambda f: col_map.get(f, '')
 
-    # Only CITY/STATE go to OSM. ADDRESS1/2/3, COUNTRY, COUNTRY_ID, POSTAL are
-    # excluded entirely — they don't need OSM (ISO/format checks are local) or
-    # weren't reliable enough to justify the extra query volume.
+    api_key = _get_geoapify_api_key()
+    if not api_key:
+        # No key configured — log nothing rather than silently failing every
+        # lookup. The caller (UI) is responsible for telling the user to set
+        # GEOAPIFY_API_KEY in Streamlit secrets before enabling this toggle.
+        return OSM_VALIDATION_LOG
+
+    # Only CITY/STATE go through Geoapify. ADDRESS1/2/3, COUNTRY, COUNTRY_ID,
+    # POSTAL are excluded — they don't need live lookup (ISO/format checks
+    # are local) or weren't reliable enough to justify the extra volume.
     FIELD_CONFIG = [
-        ('city',  'city',  {'city','town','village','municipality',
-                             'suburb','quarter','hamlet','locality',
-                             'administrative'}),
-        ('state', 'state', {'state','province','region','department',
-                             'prefecture','county','autonomous_region',
-                             'administrative','territory'}),
+        ('city',  'city',  {'city'}),
+        ('state', 'state', {'state'}),
     ]
 
     # Only rows the pipeline already flagged as uncertain — skip clean rows
@@ -1897,10 +1752,10 @@ def run_osm_validation(df, col_map):
                 OSM_VALIDATION_LOG.append(log)
                 continue
 
-            # OSM lookup (with dedup — only successful or genuine NOT_FOUND
-            # results are cached; ERROR results are never cached, so a
-            # transient failure self-heals on the next occurrence of the
-            # same value instead of poisoning every later row.)
+            # Geoapify lookup (with dedup — only successful or genuine
+            # NOT_FOUND results are cached; ERROR results are never cached,
+            # so a transient failure self-heals on the next occurrence of
+            # the same value instead of poisoning every later row.)
             if dedup_key in _seen:
                 prev = _seen[dedup_key]
                 log['osm_type']    = prev['osm_type']
@@ -1908,48 +1763,39 @@ def run_osm_validation(df, col_map):
                 log['status']      = prev['status']
                 log['note']        = prev['note']
             else:
-                _osm_failed = False
-                osm_result  = None
-                # Up to 3 attempts, each preceded by the mandatory 1 req/s
-                # delay — sleeping BEFORE the call (not after) guarantees
-                # every live HTTP request, including the very first one in
-                # the run, respects Nominatim's usage policy.
+                geo_failed  = False
+                geo_result  = None
+                # Up to 3 attempts with backoff on rate-limit/error responses.
                 for _attempt in range(3):
-                    time.sleep(1.0)
-                    osm_result = _nominatim_lookup(val, country_hint)
-                    if not (osm_result and osm_result.get('source') in
-                            ('osm_error', 'osm_rate_limited')):
+                    geo_result = _geoapify_lookup(val, country_hint)
+                    if not (geo_result and geo_result.get('source') in
+                            ('geoapify_error', 'geoapify_rate_limited')):
                         break
-                    time.sleep(2.0 * (_attempt + 1))   # extra backoff before retrying
-                _osm_failed = bool(osm_result and osm_result.get('source') in
-                                   ('osm_error', 'osm_rate_limited'))
+                    time.sleep(1.0 * (_attempt + 1))   # backoff before retrying
+                geo_failed = bool(geo_result and geo_result.get('source') in
+                                  ('geoapify_error', 'geoapify_rate_limited'))
 
-                if not _osm_failed and (not osm_result or osm_result.get('type') in ('unknown', None)):
-                    time.sleep(1.0)   # Falling Rain fallback — separate request, same courtesy
-                    fr_result = _fallingrain_lookup(val, country_hint)
-                    if fr_result and fr_result.get('type') not in ('unknown', None):
-                        osm_result = fr_result
-
-                if _osm_failed:
-                    # The request itself failed (network/rate-limit) — not a
-                    # genuine 'place doesn't exist'. Surface this distinctly
-                    # and do NOT cache it, so the next occurrence retries fresh.
+                if geo_failed:
+                    # The request itself failed (network/rate-limit/no API
+                    # key) — not a genuine 'place doesn't exist'. Surface
+                    # this distinctly and do NOT cache it, so the next
+                    # occurrence retries fresh.
                     log['status'] = 'ERROR'
-                    log['note']   = osm_result.get('note', 'OSM request failed') if osm_result else 'OSM request failed'
+                    log['note']   = geo_result.get('note', 'Geoapify request failed') if geo_result else 'Geoapify request failed'
                     OSM_VALIDATION_LOG.append(log)
                     continue
-                elif not osm_result or osm_result.get('type') in ('unknown', None):
+                elif not geo_result or geo_result.get('type') in ('unknown', None):
                     log['status'] = 'NOT_FOUND'
-                    log['note']   = 'Not found in OSM or Falling Rain'
+                    log['note']   = 'Not found by Geoapify'
                 else:
-                    osm_type = osm_result.get('type', '').lower()
-                    log['osm_type']    = osm_type
-                    log['osm_display'] = osm_result.get('note', '')[:120]
-                    if osm_type in allowed_types:
+                    geo_type = geo_result.get('type', '').lower()
+                    log['osm_type']    = geo_type
+                    log['osm_display'] = geo_result.get('note', '')[:120]
+                    if geo_type in allowed_types:
                         log['status'] = 'OK'
                     else:
                         log['status'] = 'MISMATCH'
-                        log['note']   = (f"OSM says '{osm_type}', "
+                        log['note']   = (f"Geoapify says '{geo_type}', "
                                          f"expected one of: {log['expected_types']}")
 
                 _seen[dedup_key] = log   # cache only OK/MISMATCH/NOT_FOUND, never ERROR
@@ -2637,6 +2483,19 @@ if run:
                 if addr3_v and C('address3'):
                     ex = str(df.at[idx,C('address3')]).strip()
                     setcol(idx,'address3',(ex+', '+addr3_v).strip(', ') if ex else addr3_v)
+            # Flag CITY values not found in the static reference list as
+            # uncertain — without this, places the parser confidently but
+            # unverifiably extracted (e.g. 'Tanjong Tokong') would never be
+            # checked by OSM validation, since that pass only looks at rows
+            # already marked uncertain.
+            if cty and cty.lower() not in CITY_TO_COUNTRY:
+                _existing_flag = str(df.at[idx,'EXCEPTION_FLAG']).strip() if 'EXCEPTION_FLAG' in df.columns else ''
+                _unverified_flag = 'UNVERIFIED_CITY'
+                if _existing_flag and _existing_flag not in ('', 'nan'):
+                    if _unverified_flag not in _existing_flag:
+                        df.at[idx,'EXCEPTION_FLAG'] = _existing_flag + ' | ' + _unverified_flag
+                else:
+                    df.at[idx,'EXCEPTION_FLAG'] = _unverified_flag
 
         # ── 9b. Move STATE → CITY if CITY is now blank and STATE is a city name ─
         _cty_9b = str(df.at[idx,C('city')]  if C('city')  else '').strip()
@@ -3016,22 +2875,25 @@ if run:
         use_geo_verify=False  # OSM used in dedicated validation pass below
     )
 
-    # ── OSM Post-Clean Validation ────────────────────────────────────────
+    # ── Geoapify Post-Clean Validation ────────────────────────────────────
     if geo_verify:
-        prog.progress(0.92, text="Validating flagged rows' City/State via OpenStreetMap…")
+        prog.progress(0.92, text="Validating flagged rows' City/State via Geoapify…")
         run_osm_validation(df, col_map)
         _osm_mismatches = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'MISMATCH')
         _osm_not_found  = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'NOT_FOUND')
         _osm_ok         = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'OK')
-        _osm_skipped = sum(1 for r in OSM_VALIDATION_LOG if r.get('status') == 'SKIPPED')
-        _osm_checked = len(OSM_VALIDATION_LOG) - _osm_skipped
+        _osm_error      = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'ERROR')
+        _osm_skipped    = sum(1 for r in OSM_VALIDATION_LOG if r.get('status') == 'SKIPPED')
+        _osm_checked    = len(OSM_VALIDATION_LOG) - _osm_skipped - _osm_error
         st.info(
-            f"🌐 OSM Validation ({_osm_checked} City/State values checked on flagged rows only): "
+            f"🌐 Geoapify Validation ({_osm_checked} City/State values checked on flagged rows only): "
             f"✅ {_osm_ok} OK  "
             f"⚠️ {_osm_mismatches} Mismatch  "
-            f"❓ {_osm_not_found} Not Found  "
-            f"— see **OSM Validation** sheet in download"
+            f"❓ {_osm_not_found} Not Found"
+            + (f"  🔧 {_osm_error} Error (request failed, not a data issue)" if _osm_error else "")
+            + " — see **OSM Validation** sheet in download"
         )
+
 
     # ── Completeness Check: cleaned vs raw ───────────────────────────────
     prog.progress(0.95, text="Checking data completeness against raw input…")
