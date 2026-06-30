@@ -1487,8 +1487,15 @@ def _validate_osm_result(result, place_name):
 def _nominatim_lookup(place_name, country_hint=''):
     """Query Nominatim (OpenStreetMap). Returns structured result or None."""
     import urllib.parse
+    # Don't append country_hint if it duplicates the search term itself
+    # (e.g. validating COUNTRY='Turkey' would otherwise search 'Turkey Turkey')
+    # or if it's already contained in place_name (e.g. 'Moscow Oblast, Russia').
+    _hint = country_hint.strip()
+    if _hint and (_hint.lower() == place_name.strip().lower()
+                  or _hint.lower() in place_name.lower()):
+        _hint = ''
     params = {
-        'q':              (place_name + (' ' + country_hint if country_hint else '')).strip(),
+        'q':              (place_name + (' ' + _hint if _hint else '')).strip(),
         'format':         'json',
         'addressdetails': '1',
         'limit':          '3',
@@ -1498,6 +1505,12 @@ def _nominatim_lookup(place_name, country_hint=''):
     try:
         r = requests.get(url, timeout=10,
                          headers={'User-Agent': 'address-cleaner-app/1.0'})
+        if r.status_code == 429 or r.status_code == 403:
+            # Rate-limited or blocked — NOT the same as 'place not found'.
+            # Surface this distinctly so it isn't silently treated as NOT_FOUND.
+            return {'type': 'unknown', 'confidence': 'low',
+                    'note': f'HTTP {r.status_code}: {r.text[:120]}',
+                    'source': 'osm_rate_limited'}
         r.raise_for_status()
         results = r.json()
         if not results:
@@ -1540,9 +1553,13 @@ def _nominatim_lookup(place_name, country_hint=''):
             '_osm_country': osm_country,
             'note':         best.get('display_name', '')[:150],
         }
+    except requests.exceptions.RequestException as exc:
+        # Network/connection failure — distinct from 'place not found'
+        return {'type': 'unknown', 'confidence': 'low',
+                'note': f'Network error: {exc}', 'source': 'osm_error'}
     except Exception as exc:
-        return {'type': 'unknown', 'state': '', 'country': '',
-                'confidence': 'low', 'note': str(exc), 'source': 'osm_error'}
+        return {'type': 'unknown', 'confidence': 'low',
+                'note': f'Unexpected error: {exc}', 'source': 'osm_error'}
 
 
 def parse_fr_snippet(snippet):
@@ -1910,10 +1927,24 @@ def run_osm_validation(df, col_map):
                 log['note']        = prev['note']
             else:
                 osm_result = _nominatim_lookup(val, country_hint)
+                # One retry with backoff if rate-limited — a single 429/403
+                # shouldn't permanently mark a valid place as failed.
+                if osm_result and osm_result.get('source') == 'osm_rate_limited':
+                    time.sleep(2.0)
+                    osm_result = _nominatim_lookup(val, country_hint)
+                _osm_failed = osm_result and osm_result.get('source') in ('osm_error', 'osm_rate_limited')
                 if not osm_result or osm_result.get('type') in ('unknown', None):
-                    osm_result = _fallingrain_lookup(val, country_hint)
+                    fr_result = _fallingrain_lookup(val, country_hint)
+                    if fr_result and fr_result.get('type') not in ('unknown', None):
+                        osm_result = fr_result
+                        _osm_failed = False
 
-                if not osm_result or osm_result.get('type') in ('unknown', None):
+                if _osm_failed:
+                    # The request itself failed (network/rate-limit) — not a
+                    # genuine 'place doesn't exist'. Surface this distinctly.
+                    log['status'] = 'ERROR'
+                    log['note']   = osm_result.get('note', 'OSM request failed')
+                elif not osm_result or osm_result.get('type') in ('unknown', None):
                     log['status'] = 'NOT_FOUND'
                     log['note']   = 'Not found in OSM or Falling Rain'
                 else:
@@ -1930,11 +1961,13 @@ def run_osm_validation(df, col_map):
                                          f"expected one of: {log['expected_types']}")
 
                 _seen[dedup_key] = log
-                time.sleep(0.1)   # Nominatim: max 10 req/s
+                time.sleep(1.0)   # Nominatim usage policy: max 1 req/s
 
             OSM_VALIDATION_LOG.append(log)
 
-            # Write flag to EXCEPTION_FLAG for mismatches / not-found
+            # Write flag to EXCEPTION_FLAG for mismatches / not-found.
+            # ERROR (request failed) is NOT written here — it's a tooling issue,
+            # not a data quality issue, and shouldn't be confused with one.
             if log['status'] in ('MISMATCH', 'NOT_FOUND'):
                 flag_val = f"OSM_{log['status']}:{label}={val}"
                 existing = str(df.at[idx_row, 'EXCEPTION_FLAG']).strip() if 'EXCEPTION_FLAG' in df.columns else ''
