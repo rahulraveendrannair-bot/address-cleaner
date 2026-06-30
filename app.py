@@ -1439,6 +1439,34 @@ _OSM_TYPE_MAP = {
     'country':      'country',
 }
 
+# Official Nominatim address_rank → place type, per the rank table shown on
+# https://nominatim.openstreetmap.org/ui/search.html (Details → Address Rank).
+# Used as the authoritative fallback whenever 'addresstype' is missing,
+# unmapped, or ambiguous (e.g. 'administrative' boundaries with no clear tag).
+#   4        = country
+#   5-9      = state / province / region
+#  10-12     = county / district (state subdivision)
+#  13-16     = city / municipality / town
+#  17-21     = village / suburb / hamlet / neighbourhood
+#  22-30     = street / building / POI (not a place classification)
+def _rank_to_type(rank):
+    try:
+        r = int(rank)
+    except (TypeError, ValueError):
+        return 'unknown'
+    if r <= 4:
+        return 'country'
+    if 5 <= r <= 9:
+        return 'state'
+    if 10 <= r <= 12:
+        return 'district'
+    if 13 <= r <= 16:
+        return 'city'
+    if 17 <= r <= 21:
+        return 'city'   # suburb/village/hamlet — still address-level 'city' bucket
+    return 'unknown'    # 22-30: street/building/POI — not a place classification
+
+
 def _validate_osm_result(result, place_name):
     """
     Validate an OSM result before accepting it.
@@ -1452,7 +1480,7 @@ def _validate_osm_result(result, place_name):
     if display and place_name.lower() not in display.lower():
         # Name mismatch — OSM returned something unrelated
         return False, f"name mismatch: searched '{place_name}', got '{display[:60]}'"
-    if not result.get('country'):
+    if not result.get('_osm_country'):
         return False, "no country in OSM result"
     return True, ""
 
@@ -1490,6 +1518,12 @@ def _nominatim_lookup(place_name, country_hint=''):
         # Fallback type detection from class
         if place_type == 'unknown' and best.get('class') == 'place':
             place_type = _OSM_TYPE_MAP.get(best.get('type', '').lower(), 'unknown')
+        # Final fallback: use address_rank/place_rank (same value the search.html
+        # UI shows under Details → 'Address Rank'). Catches boundary:administrative
+        # results and anything else 'addresstype' didn't resolve to a known type.
+        if place_type == 'unknown':
+            rank = best.get('address_rank', best.get('place_rank'))
+            place_type = _rank_to_type(rank)
 
         osm_state   = (addr.get('state') or addr.get('region') or
                        addr.get('province') or addr.get('department') or
