@@ -1704,12 +1704,14 @@ def run_osm_validation(df, col_map):
     parsing OSM admin tags.
 
     Auto-correction: if a CITY value is identified as a 'suburb' (village/
-    neighbourhood) or 'district' — not a standalone city — AND Geoapify's
-    response includes a different real parent city, the suburb/district
-    name is moved out of CITY into ADDRESS3 (falling back to ADDRESS2 if
-    A3 is occupied or unavailable) and the real city is promoted into
-    CITY. This is the ONLY field value this function ever modifies —
-    every other check here is flag-only, writing to EXCEPTION_FLAG and
+    neighbourhood) or 'district' — not a standalone city — the suburb/
+    district name is moved out of CITY into ADDRESS3 (falling back to
+    ADDRESS2 if A3 is occupied or unavailable). CITY is left BLANK after
+    the move — it is never filled with Geoapify's suggested parent city,
+    since that name was not present anywhere in the original source
+    address and inserting it would be fabricating data, not cleaning it.
+    This is the ONLY field value this function ever modifies — every
+    other check here is flag-only, writing to EXCEPTION_FLAG and
     OSM_VALIDATION_LOG without touching CITY/STATE/ADDRESS* values.
     """
     import time
@@ -1826,41 +1828,40 @@ def run_osm_validation(df, col_map):
 
             # ── Auto-correction: suburb/village/district in CITY ─────────
             # Only field-value change this function makes. Triggered when
-            # Geoapify confirms the CITY value is a suburb or district AND
-            # supplies a different real parent city. Moves the suburb/
-            # district name to ADDRESS3 (or ADDRESS2 if A3 is occupied/
-            # unavailable) and promotes the real city into CITY.
+            # Geoapify confirms the CITY value is actually a suburb or
+            # district, not a standalone city. Moves the suburb/district
+            # name to ADDRESS3 (or ADDRESS2 if A3 is occupied/unavailable).
+            #
+            # IMPORTANT: CITY is left BLANK after the move, never filled
+            # with Geoapify's suggested parent city. The agent must not
+            # introduce a value (e.g. 'George Town') that wasn't present
+            # anywhere in the original source address — that would be
+            # fabricating data, not cleaning it.
             if col_key == 'city' and log['status'] == 'CORRECTED' and geo_result:
-                real_city = str(geo_result.get('_geo_city', '') or '').strip()
                 _corrected_type = geo_result.get('type', 'suburb')
-                if real_city and real_city.lower() != val.lower():
-                    a3_col = C('address3')
-                    a2_col = C('address2')
-                    moved_to = None
-                    if a3_col:
-                        existing_a3 = str(df.at[idx_row, a3_col]).strip() if a3_col in df.columns else ''
-                        if not existing_a3 or existing_a3.lower() in ('', 'nan'):
-                            df.at[idx_row, a3_col] = val
-                            moved_to = 'ADDRESS3'
-                    if not moved_to and a2_col:
-                        existing_a2 = str(df.at[idx_row, a2_col]).strip() if a2_col in df.columns else ''
-                        if not existing_a2 or existing_a2.lower() in ('', 'nan'):
-                            df.at[idx_row, a2_col] = val
-                            moved_to = 'ADDRESS2'
-                    if moved_to:
-                        df.at[idx_row, col] = real_city
-                        log['note'] = f"Moved '{val}' ({_corrected_type}) to {moved_to}; promoted '{real_city}' to CITY"
-                    else:
-                        # Both ADDRESS2/3 are occupied — don't overwrite
-                        # existing data. Fall back to a flag for manual review.
-                        log['status'] = 'MISMATCH'
-                        log['note']   = (f"'{val}' is a {_corrected_type} of '{real_city}', but "
-                                         f"ADDRESS2/3 are both occupied — not auto-corrected")
+                a3_col = C('address3')
+                a2_col = C('address2')
+                moved_to = None
+                if a3_col:
+                    existing_a3 = str(df.at[idx_row, a3_col]).strip() if a3_col in df.columns else ''
+                    if not existing_a3 or existing_a3.lower() in ('', 'nan'):
+                        df.at[idx_row, a3_col] = val
+                        moved_to = 'ADDRESS3'
+                if not moved_to and a2_col:
+                    existing_a2 = str(df.at[idx_row, a2_col]).strip() if a2_col in df.columns else ''
+                    if not existing_a2 or existing_a2.lower() in ('', 'nan'):
+                        df.at[idx_row, a2_col] = val
+                        moved_to = 'ADDRESS2'
+                if moved_to:
+                    df.at[idx_row, col] = ''   # leave CITY blank — do not invent a value
+                    log['note'] = (f"Moved '{val}' ({_corrected_type}) to {moved_to}; "
+                                   f"CITY left blank (no city name was present in source data)")
                 else:
-                    # Geoapify didn't give us a distinct real city to
-                    # promote to — nothing safe to do, leave as a mismatch.
+                    # Both ADDRESS2/3 are occupied — don't overwrite
+                    # existing data. Fall back to a flag for manual review.
                     log['status'] = 'MISMATCH'
-                    log['note']   = f"'{val}' is a {_corrected_type}, but no parent city was returned"
+                    log['note']   = (f"'{val}' is a {_corrected_type}, but "
+                                     f"ADDRESS2/3 are both occupied — not auto-corrected")
 
             OSM_VALIDATION_LOG.append(log)
 
