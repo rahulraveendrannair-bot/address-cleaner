@@ -1390,13 +1390,24 @@ with st.sidebar:
         value=False,
         help="After cleaning, validates City/State only on rows already flagged as uncertain by the cleaning pipeline (e.g. low-confidence extractions, unrecognized city names). Flags mismatches in EXCEPTION_FLAG and logs results in the OSM Validation sheet. Requires a free Geoapify API key (set as GEOAPIFY_API_KEY in Streamlit secrets) — get one at myprojects.geoapify.com, free tier includes 3000 requests/day."
     )
-    if geo_verify and not _get_geoapify_api_key():
-        st.warning(
-            "⚠️ GEOAPIFY_API_KEY is not configured. Add it under Settings → "
-            "Secrets as `GEOAPIFY_API_KEY = \"your-key-here\"`, or set it as an "
-            "environment variable. Validation will run but every lookup will "
-            "report ERROR until a key is set."
-        )
+    if geo_verify:
+        _gak_check = ''
+        try:
+            if hasattr(st, 'secrets') and 'GEOAPIFY_API_KEY' in st.secrets:
+                _gak_check = str(st.secrets['GEOAPIFY_API_KEY']).strip()
+        except Exception:
+            pass
+        if not _gak_check:
+            import os as _os_check
+            _gak_check = _os_check.environ.get('GEOAPIFY_API_KEY', '').strip()
+        if not _gak_check:
+            st.warning(
+                "⚠️ GEOAPIFY_API_KEY is not configured. Add it under Settings → "
+                "Secrets as `GEOAPIFY_API_KEY = \"your-key-here\"`, or set it as an "
+                "environment variable. Validation will run but every lookup will "
+                "report ERROR until a key is set."
+            )
+
 
     run = st.button(
         "▶  Clean Addresses", type="primary",
