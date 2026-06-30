@@ -1388,7 +1388,7 @@ with st.sidebar:
     geo_verify = st.toggle(
         "🌐 Validate City/State via OpenStreetMap",
         value=False,
-        help="After cleaning, validates every City and State value against OpenStreetMap (Nominatim). Flags mismatches in EXCEPTION_FLAG and logs results in the OSM Validation sheet. Adds ~1-2s per row."
+        help="After cleaning, validates City/State only on rows already flagged as uncertain by the cleaning pipeline (e.g. low-confidence extractions). Flags OSM mismatches in EXCEPTION_FLAG and logs results in the OSM Validation sheet. Skipped on clean rows to stay within OpenStreetMap's usage policy."
     )
 
     run = st.button(
@@ -1823,14 +1823,14 @@ def _osm_validate_place(place_name, field, country_hint=''):
 
 def run_osm_validation(df, col_map):
     """
-    Validate EVERY address field in the cleaned dataframe against OpenStreetMap.
-    Fields validated and what OSM must confirm:
-      ADDRESS1/2/3 → any real place (addresstype != unknown)
-      CITY         → city / town / village / suburb / municipality
-      STATE        → state / province / region / department / prefecture
-      COUNTRY      → country
-      COUNTRY_ID   → valid ISO-2 code (checked against ISO_TO_COUNTRY, no OSM call)
-      POSTAL       → format validated by validate_postal (no OSM call)
+    Validate CITY and STATE only, and only on rows the deterministic pipeline
+    already flagged in EXCEPTION_FLAG (e.g. CITY_WAS_STATE, LOW_CONF_STATE_SKIPPED,
+    UNVALIDATED_CITY_IN_ADDR, etc.) — never the whole file.
+
+    This keeps OSM usage to genuinely uncertain cases instead of a systematic
+    bulk query over every row/column, per Nominatim's usage policy:
+    https://operations.osmfoundation.org/policies/nominatim/
+    ("No heavy uses"; "Systematic queries... are forbidden").
 
     Never modifies field values — only writes flags to EXCEPTION_FLAG and
     appends to OSM_VALIDATION_LOG for the download sheet.
@@ -1839,32 +1839,34 @@ def run_osm_validation(df, col_map):
     OSM_VALIDATION_LOG.clear()
     C = lambda f: col_map.get(f, '')
 
-    # Fields → (label, validation_mode)
-    # mode 'osm_type'  : call OSM, check returned type against allowed types
-    # mode 'osm_exists': call OSM, just confirm place exists (any type)
-    # mode 'iso'       : no OSM — check against ISO_TO_COUNTRY dict
-    # mode 'postal'    : no OSM — format check via validate_postal
+    # Only CITY/STATE go to OSM. ADDRESS1/2/3, COUNTRY, COUNTRY_ID, POSTAL are
+    # excluded entirely — they don't need OSM (ISO/format checks are local) or
+    # weren't reliable enough to justify the extra query volume.
     FIELD_CONFIG = [
-        ('city',       'city',       'osm_type',   {'city','town','village','municipality',
-                                                     'suburb','quarter','hamlet','locality',
-                                                     'administrative'}),
-        ('state',      'state',      'osm_type',   {'state','province','region','department',
-                                                     'prefecture','county','autonomous_region',
-                                                     'administrative','territory'}),
-        ('country',    'country',    'osm_type',   {'country'}),
-        ('address',    'ADDRESS1',   'osm_exists',  set()),
-        ('address2',   'ADDRESS2',   'osm_exists',  set()),
-        ('address3',   'ADDRESS3',   'osm_exists',  set()),
-        ('country_id', 'COUNTRY_ID', 'iso',         set()),
-        ('postal',     'POSTAL',     'postal',      set()),
+        ('city',  'city',  {'city','town','village','municipality',
+                             'suburb','quarter','hamlet','locality',
+                             'administrative'}),
+        ('state', 'state', {'state','province','region','department',
+                             'prefecture','county','autonomous_region',
+                             'administrative','territory'}),
     ]
+
+    # Only rows the pipeline already flagged as uncertain — skip clean rows
+    # entirely.
+    if 'EXCEPTION_FLAG' not in df.columns:
+        flagged_rows = []
+    else:
+        _flag_col = df['EXCEPTION_FLAG'].fillna('').astype(str)
+        _is_flagged = _flag_col.str.strip().ne('')
+        flagged_rows = df.index[_is_flagged].tolist()
 
     _seen = {}   # (value_lower, col_key) → log entry — dedup identical values
 
-    for idx_row, row in df.iterrows():
+    for idx_row in flagged_rows:
+        row = df.loc[idx_row]
         country_hint = str(row.get(C('country'), '') or '').strip()
 
-        for col_key, label, mode, allowed_types in FIELD_CONFIG:
+        for col_key, label, allowed_types in FIELD_CONFIG:
             col = C(col_key)
             if not col:
                 continue
@@ -1887,38 +1889,18 @@ def run_osm_validation(df, col_map):
 
             dedup_key = (val.lower(), col_key)
 
-            if mode == 'iso':
-                # COUNTRY_ID: validate ISO-2 format and known mapping
-                if not re.match(r'^[A-Z]{2}$', val):
-                    log['status'] = 'MISMATCH'
-                    log['note']   = f"Not a valid ISO-2 code: {val!r}"
-                elif val not in ISO_TO_COUNTRY:
-                    log['status'] = 'NOT_FOUND'
-                    log['note']   = f"ISO code {val!r} not in reference list"
+            # CITY/STATE values are usually short place names; skip anything
+            # that's clearly not a place (pure digits, single character).
+            if re.match(r'^\d', val) or len(val) < 2:
+                log['status'] = 'SKIPPED'
+                log['note']   = 'Not a place name'
                 OSM_VALIDATION_LOG.append(log)
                 continue
 
-            if mode == 'postal':
-                # POSTAL: validate via validate_postal function
-                postal_result = validate_postal(val, country_hint)
-                if postal_result == 'INVALID':
-                    log['status'] = 'MISMATCH'
-                    log['note']   = f'Postal format invalid for country: {country_hint or "unknown"}'
-                OSM_VALIDATION_LOG.append(log)
-                continue
-
-            # Skip short tokens, numbers, P.O. Box references for address fields
-            if mode == 'osm_exists':
-                if (len(val) < 3
-                        or re.match(r'^\d', val)
-                        or bool(PO_BOX_RE.search(val))
-                        or bool(ROOM_RE.search(val))):
-                    log['status'] = 'SKIPPED'
-                    log['note']   = 'Not a place name (number/unit/PO Box)'
-                    OSM_VALIDATION_LOG.append(log)
-                    continue
-
-            # OSM lookup (with dedup)
+            # OSM lookup (with dedup — only successful or genuine NOT_FOUND
+            # results are cached; ERROR results are never cached, so a
+            # transient failure self-heals on the next occurrence of the
+            # same value instead of poisoning every later row.)
             if dedup_key in _seen:
                 prev = _seen[dedup_key]
                 log['osm_type']    = prev['osm_type']
@@ -1926,24 +1908,36 @@ def run_osm_validation(df, col_map):
                 log['status']      = prev['status']
                 log['note']        = prev['note']
             else:
-                osm_result = _nominatim_lookup(val, country_hint)
-                # One retry with backoff if rate-limited — a single 429/403
-                # shouldn't permanently mark a valid place as failed.
-                if osm_result and osm_result.get('source') == 'osm_rate_limited':
-                    time.sleep(2.0)
+                _osm_failed = False
+                osm_result  = None
+                # Up to 3 attempts, each preceded by the mandatory 1 req/s
+                # delay — sleeping BEFORE the call (not after) guarantees
+                # every live HTTP request, including the very first one in
+                # the run, respects Nominatim's usage policy.
+                for _attempt in range(3):
+                    time.sleep(1.0)
                     osm_result = _nominatim_lookup(val, country_hint)
-                _osm_failed = osm_result and osm_result.get('source') in ('osm_error', 'osm_rate_limited')
-                if not osm_result or osm_result.get('type') in ('unknown', None):
+                    if not (osm_result and osm_result.get('source') in
+                            ('osm_error', 'osm_rate_limited')):
+                        break
+                    time.sleep(2.0 * (_attempt + 1))   # extra backoff before retrying
+                _osm_failed = bool(osm_result and osm_result.get('source') in
+                                   ('osm_error', 'osm_rate_limited'))
+
+                if not _osm_failed and (not osm_result or osm_result.get('type') in ('unknown', None)):
+                    time.sleep(1.0)   # Falling Rain fallback — separate request, same courtesy
                     fr_result = _fallingrain_lookup(val, country_hint)
                     if fr_result and fr_result.get('type') not in ('unknown', None):
                         osm_result = fr_result
-                        _osm_failed = False
 
                 if _osm_failed:
                     # The request itself failed (network/rate-limit) — not a
-                    # genuine 'place doesn't exist'. Surface this distinctly.
+                    # genuine 'place doesn't exist'. Surface this distinctly
+                    # and do NOT cache it, so the next occurrence retries fresh.
                     log['status'] = 'ERROR'
-                    log['note']   = osm_result.get('note', 'OSM request failed')
+                    log['note']   = osm_result.get('note', 'OSM request failed') if osm_result else 'OSM request failed'
+                    OSM_VALIDATION_LOG.append(log)
+                    continue
                 elif not osm_result or osm_result.get('type') in ('unknown', None):
                     log['status'] = 'NOT_FOUND'
                     log['note']   = 'Not found in OSM or Falling Rain'
@@ -1951,17 +1945,14 @@ def run_osm_validation(df, col_map):
                     osm_type = osm_result.get('type', '').lower()
                     log['osm_type']    = osm_type
                     log['osm_display'] = osm_result.get('note', '')[:120]
-                    if mode == 'osm_exists':
-                        log['status'] = 'OK'  # any recognised place type is fine
-                    elif osm_type in allowed_types:
+                    if osm_type in allowed_types:
                         log['status'] = 'OK'
                     else:
                         log['status'] = 'MISMATCH'
                         log['note']   = (f"OSM says '{osm_type}', "
                                          f"expected one of: {log['expected_types']}")
 
-                _seen[dedup_key] = log
-                time.sleep(1.0)   # Nominatim usage policy: max 1 req/s
+                _seen[dedup_key] = log   # cache only OK/MISMATCH/NOT_FOUND, never ERROR
 
             OSM_VALIDATION_LOG.append(log)
 
@@ -3027,7 +3018,7 @@ if run:
 
     # ── OSM Post-Clean Validation ────────────────────────────────────────
     if geo_verify:
-        prog.progress(0.92, text="Validating City/State values via OpenStreetMap…")
+        prog.progress(0.92, text="Validating flagged rows' City/State via OpenStreetMap…")
         run_osm_validation(df, col_map)
         _osm_mismatches = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'MISMATCH')
         _osm_not_found  = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'NOT_FOUND')
@@ -3035,7 +3026,7 @@ if run:
         _osm_skipped = sum(1 for r in OSM_VALIDATION_LOG if r.get('status') == 'SKIPPED')
         _osm_checked = len(OSM_VALIDATION_LOG) - _osm_skipped
         st.info(
-            f"🌐 OSM Validation ({_osm_checked} values checked across all fields): "
+            f"🌐 OSM Validation ({_osm_checked} City/State values checked on flagged rows only): "
             f"✅ {_osm_ok} OK  "
             f"⚠️ {_osm_mismatches} Mismatch  "
             f"❓ {_osm_not_found} Not Found  "
