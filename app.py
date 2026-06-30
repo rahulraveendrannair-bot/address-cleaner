@@ -1388,7 +1388,7 @@ with st.sidebar:
     geo_verify = st.toggle(
         "🌐 Validate City/State via Geoapify",
         value=False,
-        help="After cleaning, validates the City and State of every row against Geoapify's geocoding database. Flags mismatches in EXCEPTION_FLAG and logs results in the OSM Validation sheet. Requires a free Geoapify API key (set as GEOAPIFY_API_KEY in Streamlit secrets) — get one at myprojects.geoapify.com, free tier includes 3000 requests/day."
+        help="After cleaning, validates the City and State of every row against Geoapify's geocoding database. If a CITY value is actually a suburb or village (e.g. 'Tanjong Tokong'), it's moved to ADDRESS2/3 and the real parent city is promoted into CITY. All other mismatches are flagged in EXCEPTION_FLAG, not auto-changed. Requires a free Geoapify API key (set as GEOAPIFY_API_KEY in Streamlit secrets) — get one at myprojects.geoapify.com, free tier includes 3000 requests/day."
     )
     if geo_verify:
         _gak_check = ''
@@ -1448,9 +1448,12 @@ OSM_VALIDATION_LOG = []   # one entry per CITY/STATE value validated via Geoapif
 # Geoapify's documented result_type values (api docs: 'unknown', 'amenity',
 # 'building', 'street', 'suburb', 'district', 'postcode', 'city', 'county',
 # 'state', 'country') mapped to our internal type vocabulary.
+# NOTE: 'suburb' is intentionally kept distinct from 'city' — a suburb/
+# village value sitting in the CITY field should be corrected (moved to
+# ADDRESS2/3, with the real city promoted), not treated as already valid.
 _GEOAPIFY_TYPE_MAP = {
     'city':      'city',
-    'suburb':    'city',      # suburbs/villages classify as city-level for our purposes
+    'suburb':    'suburb',
     'district':  'district',
     'county':    'district',
     'state':     'state',
@@ -1561,17 +1564,24 @@ def _geoapify_lookup(place_name, country_hint=''):
         confidence = 'high' if confidence_score >= 0.8 else (
                      'medium' if confidence_score >= 0.4 else 'low')
 
+        geo_city    = best.get('city', '')
         geo_state   = best.get('state', '')
         geo_country = best.get('country', '')
+        geo_suburb  = best.get('suburb', '')
 
         return {
             'type':        place_type,
             'confidence':  confidence,
             'source':      'geoapify',
             'place_id':    str(best.get('place_id', '')),
-            # Metadata only — never write these to output fields:
+            # Metadata only — _geo_city/_geo_state/_geo_country are used by
+            # run_osm_validation to perform corrections (move a suburb/
+            # village out of CITY and promote the real city), but are
+            # never written directly to output fields by this function.
+            '_geo_city':    geo_city,
             '_geo_state':   geo_state,
             '_geo_country': geo_country,
+            '_geo_suburb':  geo_suburb,
             'note':         (best.get('formatted') or '')[:150],
         }
     except requests.exceptions.RequestException as exc:
@@ -1670,7 +1680,7 @@ def classify_with_geo(place_name, country_hint='',
     confidence = result.get('confidence', 'low')
     source     = result.get('source', 'unresolved')
 
-    if geo_type == 'city':
+    if geo_type in ('city', 'suburb'):
         return 'city', confidence, source
     if geo_type == 'state':
         return 'state', confidence, source
@@ -1693,8 +1703,14 @@ def run_osm_validation(df, col_map):
     required) and gives a real, documented result_type field instead of
     parsing OSM admin tags.
 
-    Never modifies field values — only writes flags to EXCEPTION_FLAG and
-    appends to OSM_VALIDATION_LOG for the download sheet.
+    Auto-correction: if a CITY value is identified as a 'suburb' (village/
+    neighbourhood) or 'district' — not a standalone city — AND Geoapify's
+    response includes a different real parent city, the suburb/district
+    name is moved out of CITY into ADDRESS3 (falling back to ADDRESS2 if
+    A3 is occupied or unavailable) and the real city is promoted into
+    CITY. This is the ONLY field value this function ever modifies —
+    every other check here is flag-only, writing to EXCEPTION_FLAG and
+    OSM_VALIDATION_LOG without touching CITY/STATE/ADDRESS* values.
     """
     import time
     OSM_VALIDATION_LOG.clear()
@@ -1765,6 +1781,7 @@ def run_osm_validation(df, col_map):
                 log['osm_display'] = prev['osm_display']
                 log['status']      = prev['status']
                 log['note']        = prev['note']
+                geo_result         = prev.get('_raw_geo_result')
             else:
                 geo_failed  = False
                 geo_result  = None
@@ -1796,19 +1813,61 @@ def run_osm_validation(df, col_map):
                     log['osm_display'] = geo_result.get('note', '')[:120]
                     if geo_type in allowed_types:
                         log['status'] = 'OK'
+                    elif col_key == 'city' and geo_type in ('suburb', 'district'):
+                        log['status'] = 'CORRECTED'
+                        log['note']   = f"Geoapify identifies '{val}' as a {geo_type}"
                     else:
                         log['status'] = 'MISMATCH'
                         log['note']   = (f"Geoapify says '{geo_type}', "
                                          f"expected one of: {log['expected_types']}")
 
-                _seen[dedup_key] = log   # cache only OK/MISMATCH/NOT_FOUND, never ERROR
+                log['_raw_geo_result'] = geo_result   # cached for dedup reuse below
+                _seen[dedup_key] = log   # cache only OK/MISMATCH/NOT_FOUND/CORRECTED, never ERROR
+
+            # ── Auto-correction: suburb/village/district in CITY ─────────
+            # Only field-value change this function makes. Triggered when
+            # Geoapify confirms the CITY value is a suburb or district AND
+            # supplies a different real parent city. Moves the suburb/
+            # district name to ADDRESS3 (or ADDRESS2 if A3 is occupied/
+            # unavailable) and promotes the real city into CITY.
+            if col_key == 'city' and log['status'] == 'CORRECTED' and geo_result:
+                real_city = str(geo_result.get('_geo_city', '') or '').strip()
+                _corrected_type = geo_result.get('type', 'suburb')
+                if real_city and real_city.lower() != val.lower():
+                    a3_col = C('address3')
+                    a2_col = C('address2')
+                    moved_to = None
+                    if a3_col:
+                        existing_a3 = str(df.at[idx_row, a3_col]).strip() if a3_col in df.columns else ''
+                        if not existing_a3 or existing_a3.lower() in ('', 'nan'):
+                            df.at[idx_row, a3_col] = val
+                            moved_to = 'ADDRESS3'
+                    if not moved_to and a2_col:
+                        existing_a2 = str(df.at[idx_row, a2_col]).strip() if a2_col in df.columns else ''
+                        if not existing_a2 or existing_a2.lower() in ('', 'nan'):
+                            df.at[idx_row, a2_col] = val
+                            moved_to = 'ADDRESS2'
+                    if moved_to:
+                        df.at[idx_row, col] = real_city
+                        log['note'] = f"Moved '{val}' ({_corrected_type}) to {moved_to}; promoted '{real_city}' to CITY"
+                    else:
+                        # Both ADDRESS2/3 are occupied — don't overwrite
+                        # existing data. Fall back to a flag for manual review.
+                        log['status'] = 'MISMATCH'
+                        log['note']   = (f"'{val}' is a {_corrected_type} of '{real_city}', but "
+                                         f"ADDRESS2/3 are both occupied — not auto-corrected")
+                else:
+                    # Geoapify didn't give us a distinct real city to
+                    # promote to — nothing safe to do, leave as a mismatch.
+                    log['status'] = 'MISMATCH'
+                    log['note']   = f"'{val}' is a {_corrected_type}, but no parent city was returned"
 
             OSM_VALIDATION_LOG.append(log)
 
-            # Write flag to EXCEPTION_FLAG for mismatches / not-found.
+            # Write flag to EXCEPTION_FLAG for mismatches / not-found / auto-corrections.
             # ERROR (request failed) is NOT written here — it's a tooling issue,
             # not a data quality issue, and shouldn't be confused with one.
-            if log['status'] in ('MISMATCH', 'NOT_FOUND'):
+            if log['status'] in ('MISMATCH', 'NOT_FOUND', 'CORRECTED'):
                 flag_val = f"OSM_{log['status']}:{label}={val}"
                 existing = str(df.at[idx_row, 'EXCEPTION_FLAG']).strip() if 'EXCEPTION_FLAG' in df.columns else ''
                 if existing and existing not in ('nan', ''):
@@ -2885,12 +2944,14 @@ if run:
         _osm_mismatches = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'MISMATCH')
         _osm_not_found  = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'NOT_FOUND')
         _osm_ok         = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'OK')
+        _osm_corrected  = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'CORRECTED')
         _osm_error      = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'ERROR')
         _osm_skipped    = sum(1 for r in OSM_VALIDATION_LOG if r.get('status') == 'SKIPPED')
         _osm_checked    = len(OSM_VALIDATION_LOG) - _osm_skipped - _osm_error
         st.info(
             f"🌐 Geoapify Validation ({_osm_checked} City/State values checked across all rows): "
             f"✅ {_osm_ok} OK  "
+            f"🔁 {_osm_corrected} Corrected (suburb/village moved out of CITY)  "
             f"⚠️ {_osm_mismatches} Mismatch  "
             f"❓ {_osm_not_found} Not Found"
             + (f"  🔧 {_osm_error} Error (request failed, not a data issue)" if _osm_error else "")
