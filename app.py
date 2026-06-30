@@ -1388,7 +1388,7 @@ with st.sidebar:
     geo_verify = st.toggle(
         "🌐 Validate City/State via Geoapify",
         value=False,
-        help="After cleaning, validates City/State only on rows already flagged as uncertain by the cleaning pipeline (e.g. low-confidence extractions, unrecognized city names). Flags mismatches in EXCEPTION_FLAG and logs results in the OSM Validation sheet. Requires a free Geoapify API key (set as GEOAPIFY_API_KEY in Streamlit secrets) — get one at myprojects.geoapify.com, free tier includes 3000 requests/day."
+        help="After cleaning, validates the City and State of every row against Geoapify's geocoding database. Flags mismatches in EXCEPTION_FLAG and logs results in the OSM Validation sheet. Requires a free Geoapify API key (set as GEOAPIFY_API_KEY in Streamlit secrets) — get one at myprojects.geoapify.com, free tier includes 3000 requests/day."
     )
     if geo_verify:
         _gak_check = ''
@@ -1687,14 +1687,11 @@ def classify_with_geo(place_name, country_hint='',
 
 def run_osm_validation(df, col_map):
     """
-    Validate CITY and STATE only, and only on rows the deterministic pipeline
-    already flagged in EXCEPTION_FLAG (e.g. CITY_WAS_STATE, LOW_CONF_STATE_SKIPPED,
-    UNVALIDATED_CITY_IN_ADDR, UNVERIFIED_CITY, etc.) — never the whole file.
+    Validate CITY and STATE for every row in the cleaned dataframe.
 
     Uses the Geoapify Geocoding API (free tier: 3000 requests/day, no card
-    required) rather than scraping or hammering a free public service —
-    this keeps usage well within reasonable limits and gives a real,
-    documented result_type field instead of parsing OSM admin tags.
+    required) and gives a real, documented result_type field instead of
+    parsing OSM admin tags.
 
     Never modifies field values — only writes flags to EXCEPTION_FLAG and
     appends to OSM_VALIDATION_LOG for the download sheet.
@@ -1718,18 +1715,12 @@ def run_osm_validation(df, col_map):
         ('state', 'state', {'state'}),
     ]
 
-    # Only rows the pipeline already flagged as uncertain — skip clean rows
-    # entirely.
-    if 'EXCEPTION_FLAG' not in df.columns:
-        flagged_rows = []
-    else:
-        _flag_col = df['EXCEPTION_FLAG'].fillna('').astype(str)
-        _is_flagged = _flag_col.str.strip().ne('')
-        flagged_rows = df.index[_is_flagged].tolist()
+    # Validate every row — no longer scoped to rows already flagged uncertain.
+    all_rows = df.index.tolist()
 
     _seen = {}   # (value_lower, col_key) → log entry — dedup identical values
 
-    for idx_row in flagged_rows:
+    for idx_row in all_rows:
         row = df.loc[idx_row]
         country_hint = str(row.get(C('country'), '') or '').strip()
 
@@ -2889,7 +2880,7 @@ if run:
 
     # ── Geoapify Post-Clean Validation ────────────────────────────────────
     if geo_verify:
-        prog.progress(0.92, text="Validating flagged rows' City/State via Geoapify…")
+        prog.progress(0.92, text="Validating City/State for all rows via Geoapify…")
         run_osm_validation(df, col_map)
         _osm_mismatches = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'MISMATCH')
         _osm_not_found  = sum(1 for r in OSM_VALIDATION_LOG if r['status'] == 'NOT_FOUND')
@@ -2898,7 +2889,7 @@ if run:
         _osm_skipped    = sum(1 for r in OSM_VALIDATION_LOG if r.get('status') == 'SKIPPED')
         _osm_checked    = len(OSM_VALIDATION_LOG) - _osm_skipped - _osm_error
         st.info(
-            f"🌐 Geoapify Validation ({_osm_checked} City/State values checked on flagged rows only): "
+            f"🌐 Geoapify Validation ({_osm_checked} City/State values checked across all rows): "
             f"✅ {_osm_ok} OK  "
             f"⚠️ {_osm_mismatches} Mismatch  "
             f"❓ {_osm_not_found} Not Found"
