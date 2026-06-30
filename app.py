@@ -1443,6 +1443,7 @@ import requests, json, re, time, os
 
 _geo_cache = {}   # (place_lower, country_lower) → result dict
 GEO_LOG    = []   # audit log of every lookup + fallback reason
+OSM_VALIDATION_LOG = []   # one entry per CITY/STATE value validated via Geoapify
 
 # Geoapify's documented result_type values (api docs: 'unknown', 'amenity',
 # 'building', 'street', 'suburb', 'district', 'postcode', 'city', 'county',
